@@ -830,3 +830,21 @@ func (db *DB) CountAll(ctx context.Context) (int, error) {
 	err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts`).Scan(&count)
 	return count, err
 }
+
+// GetAllRefreshTokens 获取所有已存在的 refresh_token（用于导入去重）
+func (db *DB) GetAllRefreshTokens(ctx context.Context) (map[string]bool, error) {
+	rows, err := db.conn.QueryContext(ctx, `SELECT credentials->>'refresh_token' FROM accounts WHERE credentials->>'refresh_token' IS NOT NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]bool)
+	for rows.Next() {
+		var rt string
+		if err := rows.Scan(&rt); err == nil && rt != "" {
+			result[rt] = true
+		}
+	}
+	return result, rows.Err()
+}

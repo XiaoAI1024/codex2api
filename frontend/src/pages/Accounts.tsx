@@ -24,7 +24,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer } from 'lucide-react'
+import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, Upload } from 'lucide-react'
 
 export default function Accounts() {
   const [showAdd, setShowAdd] = useState(false)
@@ -42,6 +42,8 @@ export default function Accounts() {
   const [cleaningBanned, setCleaningBanned] = useState(false)
   const [cleaningRateLimited, setCleaningRateLimited] = useState(false)
   const [testingAccount, setTestingAccount] = useState<AccountRow | null>(null)
+  const [importing, setImporting] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const { toast, showToast } = useToast()
   const { confirm, confirmDialog } = useConfirmDialog()
 
@@ -121,6 +123,33 @@ export default function Accounts() {
       showToast(`添加失败: ${getErrorMessage(error)}`, 'error')
     } finally {
       setSubmitting(false)
+    }
+  }
+
+  const handleFileImport = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+    if (!file.name.endsWith('.txt')) {
+      showToast('请选择 .txt 文件', 'error')
+      return
+    }
+    setImporting(true)
+    try {
+      const formData = new FormData()
+      formData.append('file', file)
+      const res = await fetch('/api/admin/accounts/import', { method: 'POST', body: formData })
+      const data = await res.json()
+      if (!res.ok) {
+        showToast(data.error || '导入失败', 'error')
+      } else {
+        showToast(data.message || '导入完成')
+        void reload()
+      }
+    } catch (error) {
+      showToast(`导入失败: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setImporting(false)
+      if (fileInputRef.current) fileInputRef.current.value = ''
     }
   }
 
@@ -295,6 +324,17 @@ export default function Accounts() {
                 <Plus className="size-3.5" />
                 添加账号
               </Button>
+              <Button variant="outline" disabled={importing} onClick={() => fileInputRef.current?.click()}>
+                <Upload className="size-3.5" />
+                {importing ? '导入中...' : '导入文件'}
+              </Button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".txt"
+                className="hidden"
+                onChange={(e) => void handleFileImport(e)}
+              />
             </div>
           )}
         />

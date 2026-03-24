@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/rand"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,6 +73,11 @@ type Account struct {
 	LastServerErrorAt       time.Time
 	LastRecoveryProbeAt     time.Time
 
+	// 滑动窗口成功率（最近 N 次请求）
+	RecentResults    [20]uint8 // 1=成功, 0=失败
+	RecentResultsIdx int       // 环形缓冲区写入位置
+	RecentResultsCnt int       // 已记录数量（最大 20）
+
 	// 高并发调度指标（原子操作，无需锁）
 	ActiveRequests int64 // 当前并发请求数
 	TotalRequests  int64 // 累计总请求数
@@ -88,6 +94,7 @@ type SchedulerBreakdown struct {
 	SuccessBonus        float64
 	UsagePenalty7d      float64
 	LatencyPenalty      float64
+	SuccessRatePenalty  float64 // 滑动窗口成功率惩罚
 }
 
 // SchedulerDebugSnapshot 调度调试快照
@@ -122,6 +129,14 @@ func clampInt(value, minValue, maxValue int) int {
 	return value
 }
 
+// fastRandN 轻量级随机数（用于调度公平性，无需加密安全）
+func fastRandN(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	return rand.Intn(n)
+}
+
 func concurrencyLimitForTier(baseLimit int64, tier AccountHealthTier) int64 {
 	if baseLimit <= 0 {
 		baseLimit = 1
@@ -129,12 +144,13 @@ func concurrencyLimitForTier(baseLimit int64, tier AccountHealthTier) int64 {
 
 	switch tier {
 	case HealthTierHealthy:
-		if baseLimit >= 3 {
-			return 3
-		}
 		return baseLimit
 	case HealthTierWarm:
-		return 1
+		half := baseLimit / 2
+		if half < 1 {
+			return 1
+		}
+		return half
 	case HealthTierRisky:
 		return 1
 	case HealthTierBanned:
@@ -186,39 +202,74 @@ func (a *Account) recordLatencyLocked(latency time.Duration) {
 	a.LatencyEWMA = a.LatencyEWMA*0.8 + latencyMs*0.2
 }
 
+// recordResultLocked 记录一次请求结果到滑动窗口（必须持有锁）
+func (a *Account) recordResultLocked(success bool) {
+	if success {
+		a.RecentResults[a.RecentResultsIdx] = 1
+	} else {
+		a.RecentResults[a.RecentResultsIdx] = 0
+	}
+	a.RecentResultsIdx = (a.RecentResultsIdx + 1) % len(a.RecentResults)
+	if a.RecentResultsCnt < len(a.RecentResults) {
+		a.RecentResultsCnt++
+	}
+}
+
+// recentSuccessRateLocked 计算滑动窗口成功率 (0.0 ~ 1.0)
+func (a *Account) recentSuccessRateLocked() float64 {
+	if a.RecentResultsCnt == 0 {
+		return 1.0 // 无数据时返回 100%
+	}
+	var sum int
+	for i := 0; i < a.RecentResultsCnt; i++ {
+		sum += int(a.RecentResults[i])
+	}
+	return float64(sum) / float64(a.RecentResultsCnt)
+}
+
+// linearDecay 线性衰减：返回 base × max(0, 1 - elapsed/window)
+func linearDecay(base float64, elapsed, window time.Duration) float64 {
+	if elapsed >= window || window <= 0 {
+		return 0
+	}
+	return base * (1.0 - float64(elapsed)/float64(window))
+}
+
 func (a *Account) schedulerBreakdownLocked() SchedulerBreakdown {
 	now := time.Now()
 	breakdown := SchedulerBreakdown{}
 
+	// 线性衰减惩罚：随时间平滑更无突变
 	if !a.LastUnauthorizedAt.IsZero() {
-		since := now.Sub(a.LastUnauthorizedAt)
-		switch {
-		case since < time.Hour:
-			breakdown.UnauthorizedPenalty = 50
-		case since < 6*time.Hour:
-			breakdown.UnauthorizedPenalty = 30
-		case since < 24*time.Hour:
-			breakdown.UnauthorizedPenalty = 15
-		}
+		elapsed := now.Sub(a.LastUnauthorizedAt)
+		breakdown.UnauthorizedPenalty = linearDecay(50, elapsed, 24*time.Hour)
 	}
 	if !a.LastRateLimitedAt.IsZero() {
-		since := now.Sub(a.LastRateLimitedAt)
-		switch {
-		case since < 10*time.Minute:
-			breakdown.RateLimitPenalty = 22
-		case since < time.Hour:
-			breakdown.RateLimitPenalty = 10
-		}
+		elapsed := now.Sub(a.LastRateLimitedAt)
+		breakdown.RateLimitPenalty = linearDecay(22, elapsed, time.Hour)
 	}
-	if !a.LastTimeoutAt.IsZero() && now.Sub(a.LastTimeoutAt) < 15*time.Minute {
-		breakdown.TimeoutPenalty = 18
+	if !a.LastTimeoutAt.IsZero() {
+		elapsed := now.Sub(a.LastTimeoutAt)
+		breakdown.TimeoutPenalty = linearDecay(18, elapsed, 15*time.Minute)
 	}
-	if !a.LastServerErrorAt.IsZero() && now.Sub(a.LastServerErrorAt) < 15*time.Minute {
-		breakdown.ServerPenalty = 12
+	if !a.LastServerErrorAt.IsZero() {
+		elapsed := now.Sub(a.LastServerErrorAt)
+		breakdown.ServerPenalty = linearDecay(12, elapsed, 15*time.Minute)
 	}
 
 	breakdown.FailurePenalty = float64(clampInt(a.FailureStreak*6, 0, 24))
 	breakdown.SuccessBonus = float64(clampInt(a.SuccessStreak*2, 0, 12))
+
+	// 滑动窗口成功率惩罚
+	if a.RecentResultsCnt >= 5 { // 至少 5 次请求才统计
+		rate := a.recentSuccessRateLocked()
+		switch {
+		case rate < 0.5:
+			breakdown.SuccessRatePenalty = 15
+		case rate < 0.75:
+			breakdown.SuccessRatePenalty = 8
+		}
+	}
 
 	if a.UsagePercent7dValid && strings.EqualFold(a.PlanType, "free") {
 		switch {
@@ -255,7 +306,8 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 		breakdown.ServerPenalty -
 		breakdown.FailurePenalty -
 		breakdown.UsagePenalty7d -
-		breakdown.LatencyPenalty +
+		breakdown.LatencyPenalty -
+		breakdown.SuccessRatePenalty +
 		breakdown.SuccessBonus
 
 	tier := HealthTierHealthy
@@ -810,7 +862,7 @@ func (s *Store) CleanByRuntimeStatus(ctx context.Context, targetStatus string) i
 
 // ==================== 最少连接调度 ====================
 
-// Next 获取下一个可用账号（健康优先 + 低负载择优）
+// Next 获取下一个可用账号（健康优先 + 低负载择优 + warm 公平调度）
 func (s *Store) Next() *Account {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -820,6 +872,9 @@ func (s *Store) Next() *Account {
 	bestScore := -math.MaxFloat64
 	var bestLoad int64 = math.MaxInt64
 	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
+
+	// 收集所有可用候选（用于公平调度）
+	var candidates []*Account
 
 	for _, acc := range s.accounts {
 		if !acc.IsAvailable() {
@@ -832,14 +887,27 @@ func (s *Store) Next() *Account {
 			continue
 		}
 
+		candidates = append(candidates, acc)
+
 		priority := tierPriority(tier)
 		if priority > bestPriority ||
 			(priority == bestPriority && (score > bestScore ||
-				(score == bestScore && load < bestLoad))) {
+				(score == bestScore && load < bestLoad) ||
+				(score == bestScore && load == bestLoad && fastRandN(2) == 0))) {
 			bestPriority = priority
 			bestScore = score
 			bestLoad = load
 			best = acc
+		}
+	}
+
+	// Warm 公平调度：15% 概率随机选一个非 best 候选，避免 warm 饥饿
+	if best != nil && len(candidates) > 1 && bestPriority >= tierPriority(HealthTierHealthy) {
+		if fastRandN(100) < 15 {
+			alt := candidates[fastRandN(len(candidates))]
+			if alt != best {
+				best = alt
+			}
 		}
 	}
 
@@ -1043,6 +1111,7 @@ func (s *Store) ReportRequestSuccess(acc *Account, latency time.Duration) {
 	defer acc.mu.Unlock()
 
 	acc.recordLatencyLocked(latency)
+	acc.recordResultLocked(true)
 	acc.LastSuccessAt = time.Now()
 	acc.SuccessStreak = clampInt(acc.SuccessStreak+1, 0, 20)
 	acc.FailureStreak = 0
@@ -1063,6 +1132,7 @@ func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Dur
 	defer acc.mu.Unlock()
 
 	acc.recordLatencyLocked(latency)
+	acc.recordResultLocked(false)
 	acc.LastFailureAt = now
 	acc.FailureStreak = clampInt(acc.FailureStreak+1, 0, 20)
 	acc.SuccessStreak = 0
@@ -1270,6 +1340,28 @@ func (s *Store) parallelRecoveryProbe(ctx context.Context) {
 
 			if err := probeFn(probeCtx, account); err != nil {
 				log.Printf("[账号 %d] 恢复探测失败: %v", account.DBID, err)
+			} else {
+				// 探测成功：将账号从 banned 升级到 warm，给予重新调度的机会
+				account.mu.Lock()
+				if account.HealthTier == HealthTierBanned {
+					account.HealthTier = HealthTierWarm
+					account.SchedulerScore = 80
+					account.FailureStreak = 0
+					account.SuccessStreak = 1
+					account.LastSuccessAt = time.Now()
+					if account.Status == StatusCooldown {
+						account.Status = StatusReady
+						account.CooldownUtil = time.Time{}
+						account.CooldownReason = ""
+					}
+					account.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+					log.Printf("[账号 %d] 恢复探测成功！已从 banned 升级到 warm", account.DBID)
+				}
+				account.mu.Unlock()
+				// 清理数据库冷却状态
+				if s.db != nil {
+					_ = s.db.ClearCooldown(context.Background(), account.DBID)
+				}
 			}
 		}(acc)
 	}

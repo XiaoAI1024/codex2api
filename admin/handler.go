@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/codex2api/auth"
@@ -54,6 +56,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/stats", h.GetStats)
 	api.GET("/accounts", h.ListAccounts)
 	api.POST("/accounts", h.AddAccount)
+	api.POST("/accounts/import", h.ImportAccounts)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.POST("/accounts/:id/refresh", h.RefreshAccount)
 	api.GET("/accounts/:id/test", h.TestConnection)
@@ -144,6 +147,7 @@ type schedulerBreakdownResponse struct {
 	SuccessBonus        float64 `json:"success_bonus"`
 	UsagePenalty7d      float64 `json:"usage_penalty_7d"`
 	LatencyPenalty      float64 `json:"latency_penalty"`
+	SuccessRatePenalty  float64 `json:"success_rate_penalty"`
 }
 
 // ListAccounts 获取账号列表
@@ -196,6 +200,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 				SuccessBonus:        debug.Breakdown.SuccessBonus,
 				UsagePenalty7d:      debug.Breakdown.UsagePenalty7d,
 				LatencyPenalty:      debug.Breakdown.LatencyPenalty,
+				SuccessRatePenalty:  debug.Breakdown.SuccessRatePenalty,
 			}
 			if usagePct, ok := acc.GetUsagePercent7d(); ok {
 				resp.UsagePercent7d = &usagePct
@@ -314,6 +319,141 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		"message": msg,
 		"success": successCount,
 		"failed":  failCount,
+	})
+}
+
+// ImportAccounts 通过 TXT 文件批量导入账号（每行一个 RT）
+func (h *Handler) ImportAccounts(c *gin.Context) {
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "请上传文件（字段名: file）")
+		return
+	}
+	defer file.Close()
+
+	// 限制文件大小 2MB
+	if header.Size > 2*1024*1024 {
+		writeError(c, http.StatusBadRequest, "文件大小不能超过 2MB")
+		return
+	}
+
+	proxyURL := c.PostForm("proxy_url")
+
+	data, err := io.ReadAll(file)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "读取文件失败")
+		return
+	}
+
+	// 按行分割，去重
+	lines := strings.Split(string(data), "\n")
+	seen := make(map[string]bool)
+	var tokens []string
+	for _, line := range lines {
+		t := strings.TrimSpace(line)
+		t = strings.TrimPrefix(t, "\xef\xbb\xbf") // 去除 UTF-8 BOM
+		if t != "" && !seen[t] {
+			seen[t] = true
+			tokens = append(tokens, t)
+		}
+	}
+
+	if len(tokens) == 0 {
+		writeError(c, http.StatusBadRequest, "文件中未找到有效的 Refresh Token")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
+	defer cancel()
+
+	// 查询已有 RT 进行去重
+	existingRTs, err := h.db.GetAllRefreshTokens(ctx)
+	if err != nil {
+		log.Printf("查询已有 RT 失败: %v", err)
+		existingRTs = make(map[string]bool) // 查询失败时不阻塞导入
+	}
+
+	// 过滤掉已存在的 RT
+	var newTokens []string
+	duplicateCount := 0
+	for _, t := range tokens {
+		if existingRTs[t] {
+			duplicateCount++
+		} else {
+			newTokens = append(newTokens, t)
+		}
+	}
+
+	if len(newTokens) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"message":   fmt.Sprintf("所有 %d 个 RT 已存在，无需导入", len(tokens)),
+			"success":   0,
+			"duplicate": duplicateCount,
+			"failed":    0,
+			"total":     len(tokens),
+		})
+		return
+	}
+
+	successCount := 0
+	failCount := 0
+
+	// 并发刷新控制（最多 10 个并发）
+	sem := make(chan struct{}, 10)
+	var wg sync.WaitGroup
+
+	for i, rt := range newTokens {
+		name := fmt.Sprintf("import-%d", i+1)
+
+		id, err := h.db.InsertAccount(ctx, name, rt, proxyURL)
+		if err != nil {
+			log.Printf("导入账号 %d 失败: %v", i+1, err)
+			failCount++
+			continue
+		}
+
+		successCount++
+
+		newAcc := &auth.Account{
+			DBID:         id,
+			RefreshToken: rt,
+			ProxyURL:     proxyURL,
+		}
+		h.store.AddAccount(newAcc)
+
+		// 受控并发刷新
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(accountID int64) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
+				log.Printf("导入账号 %d 刷新失败: %v", accountID, err)
+			} else {
+				log.Printf("导入账号 %d 刷新成功", accountID)
+			}
+		}(id)
+	}
+
+	// 等待所有刷新完成
+	wg.Wait()
+
+	msg := fmt.Sprintf("成功导入 %d 个账号", successCount)
+	if duplicateCount > 0 {
+		msg += fmt.Sprintf("，%d 个重复跳过", duplicateCount)
+	}
+	if failCount > 0 {
+		msg += fmt.Sprintf("，%d 个失败", failCount)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":   msg,
+		"success":   successCount,
+		"duplicate": duplicateCount,
+		"failed":    failCount,
+		"total":     len(tokens),
 	})
 }
 
