@@ -68,21 +68,11 @@ export default function Layout({ children }: PropsWithChildren) {
             </nav>
 
             {/* Footer */}
-            <div className="mt-auto">
-              <div className="rounded-2xl border border-border bg-white/62 px-4 py-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.75)] backdrop-blur-sm">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="text-[13px] font-semibold text-foreground">代理服务</div>
-                    <p className="mt-1 text-[12px] leading-5 text-muted-foreground">
-                      账号、流量、健康度统一查看
-                    </p>
-                  </div>
-                  <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-[hsl(var(--success-bg))] px-2.5 py-1 text-[11px] font-bold text-[hsl(var(--success))]">
-                    <span className="size-2 rounded-full bg-emerald-500" />
-                    在线
-                  </span>
-                </div>
-              </div>
+            <div className="mt-auto flex justify-start">
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/16 bg-[hsl(var(--success-bg))] px-3 py-1.5 text-[11px] font-bold text-[hsl(var(--success))] shadow-[inset_0_1px_0_rgba(255,255,255,0.55)]">
+                <span className="size-2 rounded-full bg-emerald-500" />
+                在线
+              </span>
             </div>
           </div>
         </aside>
