@@ -24,6 +24,7 @@ import {
 } from '@/components/ui/table'
 import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X } from 'lucide-react'
 import { Input } from '@/components/ui/input'
+import { Select } from '@/components/ui/select'
 
 function formatTokens(value?: number | null): string {
   if (value === undefined || value === null) return '0'
@@ -316,7 +317,7 @@ export default function Usage() {
             {/* 筛选栏 */}
             <div className="flex items-center gap-2 mb-4 flex-wrap">
               {/* 搜索框 */}
-              <div className="relative w-52">
+              <div className="relative w-72">
                 <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground pointer-events-none" />
                 <Input
                   className="pl-8 h-8 rounded-lg text-[13px]"
@@ -327,38 +328,39 @@ export default function Usage() {
               </div>
 
               {/* 模型下拉 */}
-              <select
+              <Select
                 value={filterModel}
-                onChange={(e) => { setFilterModel(e.target.value); setPage(1) }}
-                className="h-8 rounded-lg border border-border bg-background px-2.5 text-[13px] text-foreground outline-none focus:ring-1 focus:ring-ring"
-              >
-                <option value="">{t('usage.allModels')}</option>
-                {['gpt-5.4', 'gpt-5.4-mini', 'gpt-5', 'gpt-5-codex', 'gpt-5-codex-mini', 'gpt-5.1', 'gpt-5.1-codex', 'gpt-5.1-codex-mini', 'gpt-5.1-codex-max', 'gpt-5.2', 'gpt-5.2-codex', 'gpt-5.3-codex'].map((m) => (
-                  <option key={m} value={m}>{m}</option>
-                ))}
-              </select>
+                onValueChange={(v) => { setFilterModel(v); setPage(1) }}
+                placeholder={t('usage.allModels')}
+                options={[
+                  { label: t('usage.allModels'), value: '' },
+                  ...['gpt-5.4', 'gpt-5.4-mini', 'gpt-5', 'gpt-5-codex', 'gpt-5-codex-mini', 'gpt-5.1', 'gpt-5.1-codex', 'gpt-5.1-codex-mini', 'gpt-5.1-codex-max', 'gpt-5.2', 'gpt-5.2-codex', 'gpt-5.3-codex'].map((m) => ({ label: m, value: m })),
+                ]}
+              />
 
               {/* 端点下拉 */}
-              <select
+              <Select
                 value={filterEndpoint}
-                onChange={(e) => { setFilterEndpoint(e.target.value); setPage(1) }}
-                className="h-8 rounded-lg border border-border bg-background px-2.5 text-[13px] text-foreground outline-none focus:ring-1 focus:ring-ring"
-              >
-                <option value="">{t('usage.allEndpoints')}</option>
-                <option value="/v1/chat/completions">/v1/chat/completions</option>
-                <option value="/v1/responses">/v1/responses</option>
-              </select>
+                onValueChange={(v) => { setFilterEndpoint(v); setPage(1) }}
+                placeholder={t('usage.allEndpoints')}
+                options={[
+                  { label: t('usage.allEndpoints'), value: '' },
+                  { label: '/v1/chat/completions', value: '/v1/chat/completions' },
+                  { label: '/v1/responses', value: '/v1/responses' },
+                ]}
+              />
 
               {/* 类型下拉 */}
-              <select
+              <Select
                 value={filterStream}
-                onChange={(e) => { setFilterStream(e.target.value as '' | 'true' | 'false'); setPage(1) }}
-                className="h-8 rounded-lg border border-border bg-background px-2.5 text-[13px] text-foreground outline-none focus:ring-1 focus:ring-ring"
-              >
-                <option value="">{t('usage.allTypes')}</option>
-                <option value="true">Stream</option>
-                <option value="false">Sync</option>
-              </select>
+                onValueChange={(v) => { setFilterStream(v); setPage(1) }}
+                placeholder={t('usage.allTypes')}
+                options={[
+                  { label: t('usage.allTypes'), value: '' },
+                  { label: 'Stream', value: 'true' },
+                  { label: 'Sync', value: 'false' },
+                ]}
+              />
 
               {/* Fast 筛选 */}
               <button
