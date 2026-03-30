@@ -72,7 +72,8 @@ func (h *Handler) TestConnection(c *gin.Context) {
 
 	// 发送请求
 	start := time.Now()
-	resp, reqErr := proxy.ExecuteRequest(c.Request.Context(), account, payload, "", "", "", nil, nil)
+	proxyURL := h.store.NextProxy()
+	resp, reqErr := proxy.ExecuteRequest(c.Request.Context(), account, payload, "", proxyURL, "", nil, nil)
 	if reqErr != nil {
 		sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("请求失败: %s", reqErr.Error())})
 		return
@@ -216,7 +217,8 @@ func (h *Handler) BatchTest(c *gin.Context) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			resp, err := proxy.ExecuteRequest(context.Background(), acc, payload, "", "", "", nil, nil)
+			proxyURL := h.store.NextProxy()
+			resp, err := proxy.ExecuteRequest(context.Background(), acc, payload, "", proxyURL, "", nil, nil)
 			if err != nil {
 				atomic.AddInt64(&failedCount, 1)
 				return
