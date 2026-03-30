@@ -166,6 +166,7 @@ func main() {
 
 	handler.RegisterRoutes(r)
 	adminHandler.RegisterRoutes(r)
+	adminHandler.RegisterCliproxyRoutes(r)
 
 	// 管理后台前端静态文件
 	subFS, err := fs.Sub(frontendFS, "frontend/dist")

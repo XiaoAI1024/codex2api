@@ -1422,6 +1422,60 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 	return accounts, rows.Err()
 }
 
+// ListAll 获取全部账号（包含 error 状态）
+func (db *DB) ListAll(ctx context.Context) ([]*AccountRow, error) {
+	query := `
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, created_at, updated_at
+		FROM accounts
+		ORDER BY id
+	`
+	rows, err := db.conn.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("查询账号失败: %w", err)
+	}
+	defer rows.Close()
+
+	var accounts []*AccountRow
+	for rows.Next() {
+		a := &AccountRow{}
+		var credRaw interface{}
+		var cooldownUntilRaw interface{}
+		var createdAtRaw interface{}
+		var updatedAtRaw interface{}
+		if err := rows.Scan(
+			&a.ID,
+			&a.Name,
+			&a.Platform,
+			&a.Type,
+			&credRaw,
+			&a.ProxyURL,
+			&a.Status,
+			&a.CooldownReason,
+			&cooldownUntilRaw,
+			&a.ErrorMessage,
+			&createdAtRaw,
+			&updatedAtRaw,
+		); err != nil {
+			return nil, fmt.Errorf("扫描账号行失败: %w", err)
+		}
+		a.Credentials = decodeCredentials(credRaw)
+		a.CooldownUntil, err = parseDBNullTimeValue(cooldownUntilRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析 cooldown_until 失败: %w", err)
+		}
+		a.CreatedAt, err = parseDBTimeValue(createdAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析 created_at 失败: %w", err)
+		}
+		a.UpdatedAt, err = parseDBTimeValue(updatedAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析 updated_at 失败: %w", err)
+		}
+		accounts = append(accounts, a)
+	}
+	return accounts, rows.Err()
+}
+
 // UpdateCredentials 原子合并更新账号的 credentials（JSONB || 运算符，不覆盖已有字段）
 // 解决并发刷新时一个进程覆盖另一个进程写入的字段的问题
 func (db *DB) UpdateCredentials(ctx context.Context, id int64, credentials map[string]interface{}) error {
