@@ -334,6 +334,14 @@ func parseUsageLimitDetails(body []byte) (usageLimitDetails, bool) {
 	}, true
 }
 
+func parseUpstreamErrorBrief(body []byte) (code string, message string) {
+	if len(body) == 0 {
+		return "", ""
+	}
+	return strings.TrimSpace(gjson.GetBytes(body, "error.code").String()),
+		strings.TrimSpace(gjson.GetBytes(body, "error.message").String())
+}
+
 // Responses 处理 /v1/responses 请求（原生透传，增强输入验证）
 func (h *Handler) Responses(c *gin.Context) {
 	// 1. 读取请求体
@@ -1254,6 +1262,8 @@ func parseRetryAfter(body []byte) time.Duration {
 func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []byte, resp *http.Response) {
 	switch statusCode {
 	case http.StatusTooManyRequests:
+		errCode, errMsg := parseUpstreamErrorBrief(body)
+		account.SetLastFailureDetail(statusCode, errCode, errMsg)
 		now := time.Now()
 		if details, ok := parseUsageLimitDetails(body); ok {
 			var until time.Time
@@ -1280,6 +1290,8 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 		log.Printf("账号 %d 被限速 (plan=%s)，进入等待模式 %v（2小时测活一次）", account.ID(), account.GetPlanType(), cooldown)
 		h.store.MarkCooldown(account, cooldown, "rate_limited")
 	case http.StatusUnauthorized:
+		errCode, errMsg := parseUpstreamErrorBrief(body)
+		account.SetLastFailureDetail(statusCode, errCode, errMsg)
 		// 原子标志瞬间置位，阻止其他并发请求再选到该账号
 		atomic.StoreInt32(&account.Disabled, 1)
 

@@ -71,7 +71,7 @@ export default function Accounts() {
   const { t } = useTranslation()
   const [showAdd, setShowAdd] = useState(false)
   const [page, setPage] = useState(1)
-  const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned'>('all')
+  const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'full_usage' | 'banned'>('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [planFilter, setPlanFilter] = useState<'all' | 'pro' | 'team' | 'free'>('all')
   const [sortKey, setSortKey] = useState<'requests' | 'usage' | 'importTime' | null>(null)
@@ -155,6 +155,7 @@ export default function Accounts() {
   const totalAccounts = accounts.length
   const normalAccounts = accounts.filter((account) => account.status === 'active' || account.status === 'ready').length
   const rateLimitedAccounts = accounts.filter((account) => account.status === 'rate_limited').length
+  const fullUsageAccounts = accounts.filter((account) => account.status === 'full_usage').length
   const bannedAccounts = accounts.filter((account) => account.status === 'unauthorized').length
   const healthyAccounts = accounts.filter((account) => account.health_tier === 'healthy').length
   const warmAccounts = accounts.filter((account) => account.health_tier === 'warm').length
@@ -168,6 +169,9 @@ export default function Accounts() {
         break
       case 'rate_limited':
         if (account.status !== 'rate_limited') return false
+        break
+      case 'full_usage':
+        if (account.status !== 'full_usage') return false
         break
       case 'banned':
         if (account.status !== 'unauthorized') return false
@@ -735,16 +739,17 @@ export default function Accounts() {
           )}
         />
 
-        <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
+        <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-5">
           <CompactStat label={t('accounts.totalAccounts')} chipLabel={t('accounts.filterAll')} value={totalAccounts} tone="neutral" />
           <CompactStat label={t('accounts.normalAccounts')} chipLabel={t('accounts.filterNormal')} value={normalAccounts} tone="success" />
           <CompactStat label={t('accounts.rateLimited')} chipLabel={t('accounts.filterRateLimited')} value={rateLimitedAccounts} tone="warning" />
+          <CompactStat label={t('accounts.fullUsageAccounts')} chipLabel={t('accounts.filterFullUsage')} value={fullUsageAccounts} tone="warning" />
           <CompactStat label={t('accounts.bannedAccounts')} chipLabel={t('accounts.filterBanned')} value={bannedAccounts} tone="danger" />
         </div>
 
         <div className="mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-border bg-white/55 px-4 py-3 text-[12px] text-muted-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.72)]">
           <span className="font-semibold text-foreground">{t('accounts.filter')}</span>
-          {([['all', t('accounts.filterAll')], ['normal', t('accounts.filterNormal')], ['rate_limited', t('accounts.filterRateLimited')], ['banned', t('accounts.filterBanned')]] as const).map(([key, label]) => (
+          {([['all', t('accounts.filterAll')], ['normal', t('accounts.filterNormal')], ['rate_limited', t('accounts.filterRateLimited')], ['full_usage', t('accounts.filterFullUsage')], ['banned', t('accounts.filterBanned')]] as const).map(([key, label]) => (
             <button
               key={key}
               onClick={() => { setStatusFilter(key); setPage(1) }}
@@ -754,7 +759,7 @@ export default function Accounts() {
                   : 'bg-muted/50 text-muted-foreground hover:bg-muted'
               }`}
             >
-              {label} {key === 'all' ? totalAccounts : key === 'normal' ? normalAccounts : key === 'rate_limited' ? rateLimitedAccounts : bannedAccounts}
+              {label} {key === 'all' ? totalAccounts : key === 'normal' ? normalAccounts : key === 'rate_limited' ? rateLimitedAccounts : key === 'full_usage' ? fullUsageAccounts : bannedAccounts}
             </button>
           ))}
         </div>
@@ -934,6 +939,11 @@ export default function Accounts() {
                                     time: formatWaitPoint(account.wait_until),
                                   })}
                                 </div>
+                              </div>
+                            ) : null}
+                            {account.last_failure_message ? (
+                              <div className="text-[11px] text-red-600 break-all">
+                                {`${account.last_failure_status ?? ''} ${account.last_failure_message}`.trim()}
                               </div>
                             ) : null}
                           </div>

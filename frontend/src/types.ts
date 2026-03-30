@@ -27,6 +27,9 @@ export interface AccountRow {
   wait_remaining_seconds?: number
   wait_probe_at?: ISODateString
   wait_probe_remaining_seconds?: number
+  last_failure_status?: number
+  last_failure_code?: string
+  last_failure_message?: string
   at_only?: boolean
   health_tier?: string
   scheduler_score?: number

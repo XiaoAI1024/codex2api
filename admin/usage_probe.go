@@ -48,10 +48,12 @@ func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account)
 		h.store.ClearCooldown(account)
 		return nil
 	case http.StatusUnauthorized:
+		account.SetLastFailureDetail(http.StatusUnauthorized, "unauthorized", "Unauthorized")
 		h.store.ReportRequestFailure(account, "client", 0)
 		h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
 		return nil
 	case http.StatusTooManyRequests:
+		account.SetLastFailureDetail(http.StatusTooManyRequests, "rate_limited", "Rate limited")
 		h.store.ReportRequestFailure(account, "client", 0)
 		if _, cooldownReason, _ := account.GetCooldownSnapshot(); cooldownReason == "full_usage" {
 			if h.store.MarkFullUsageCooldownFromSnapshot(account) {

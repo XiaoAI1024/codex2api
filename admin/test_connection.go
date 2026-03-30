@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -84,6 +85,10 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		if usagePct, ok := proxy.ParseCodexUsageHeaders(resp, account); ok {
 			h.store.PersistUsageSnapshot(account, usagePct)
 		}
+		errBody, _ := io.ReadAll(resp.Body)
+		errCode := strings.TrimSpace(gjson.GetBytes(errBody, "error.code").String())
+		errMsg := strings.TrimSpace(gjson.GetBytes(errBody, "error.message").String())
+		account.SetLastFailureDetail(resp.StatusCode, errCode, errMsg)
 		switch resp.StatusCode {
 		case http.StatusUnauthorized:
 			h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
@@ -92,7 +97,6 @@ func (h *Handler) TestConnection(c *gin.Context) {
 				h.store.MarkCooldown(account, auth.RateLimitedProbeInterval, "rate_limited")
 			}
 		}
-		errBody, _ := io.ReadAll(resp.Body)
 		sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(errBody), 500))})
 		return
 	}
@@ -114,6 +118,7 @@ func (h *Handler) TestConnection(c *gin.Context) {
 				sendTestEvent(c, testEvent{Type: "content", Text: delta})
 			}
 		case "response.completed":
+			account.ClearLastFailureDetail()
 			if cooldownUntil, cooldownReason, active := account.GetCooldownSnapshot(); !(active && cooldownReason == "full_usage" && time.Now().Before(cooldownUntil)) {
 				h.store.ClearCooldown(account)
 			}
@@ -228,24 +233,29 @@ func (h *Handler) BatchTest(c *gin.Context) {
 				return
 			}
 			defer resp.Body.Close()
-			io.ReadAll(resp.Body) // 消费 body
+			errBody, _ := io.ReadAll(resp.Body)
+			errCode := strings.TrimSpace(gjson.GetBytes(errBody, "error.code").String())
+			errMsg := strings.TrimSpace(gjson.GetBytes(errBody, "error.message").String())
 
 			switch resp.StatusCode {
 			case http.StatusOK:
 				if usagePct, ok := proxy.ParseCodexUsageHeaders(resp, acc); ok {
 					h.store.PersistUsageSnapshot(acc, usagePct)
 				}
+				acc.ClearLastFailureDetail()
 				if cooldownUntil, cooldownReason, active := acc.GetCooldownSnapshot(); !(active && cooldownReason == "full_usage" && time.Now().Before(cooldownUntil)) {
 					h.store.ClearCooldown(acc)
 				}
 				atomic.AddInt64(&successCount, 1)
 			case http.StatusUnauthorized:
+				acc.SetLastFailureDetail(resp.StatusCode, errCode, errMsg)
 				if usagePct, ok := proxy.ParseCodexUsageHeaders(resp, acc); ok {
 					h.store.PersistUsageSnapshot(acc, usagePct)
 				}
 				h.store.MarkCooldown(acc, 24*time.Hour, "unauthorized")
 				atomic.AddInt64(&bannedCount, 1)
 			case http.StatusTooManyRequests:
+				acc.SetLastFailureDetail(resp.StatusCode, errCode, errMsg)
 				if usagePct, ok := proxy.ParseCodexUsageHeaders(resp, acc); ok {
 					h.store.PersistUsageSnapshot(acc, usagePct)
 				}

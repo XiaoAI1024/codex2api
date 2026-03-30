@@ -235,6 +235,9 @@ type accountResponse struct {
 	WaitRemainingSec   int64                      `json:"wait_remaining_seconds,omitempty"`
 	WaitProbeAt        string                     `json:"wait_probe_at,omitempty"`
 	WaitProbeRemaining int64                      `json:"wait_probe_remaining_seconds,omitempty"`
+	LastFailureStatus  int                        `json:"last_failure_status,omitempty"`
+	LastFailureCode    string                     `json:"last_failure_code,omitempty"`
+	LastFailureMessage string                     `json:"last_failure_message,omitempty"`
 	ATOnly             bool                       `json:"at_only"`
 	HealthTier         string                     `json:"health_tier"`
 	SchedulerScore     float64                    `json:"scheduler_score"`
@@ -351,6 +354,11 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			}
 			if !debug.LastServerErrorAt.IsZero() {
 				resp.LastServerErrorAt = debug.LastServerErrorAt.Format(time.RFC3339)
+			}
+			if statusCode, code, message := acc.GetLastFailureDetail(); statusCode > 0 || code != "" || message != "" {
+				resp.LastFailureStatus = statusCode
+				resp.LastFailureCode = code
+				resp.LastFailureMessage = message
 			}
 			// 使用运行时状态（优先于 DB 状态）
 			resp.Status = acc.RuntimeStatus()

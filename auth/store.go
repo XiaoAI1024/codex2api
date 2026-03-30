@@ -102,6 +102,9 @@ type Account struct {
 	LastRecoveryProbeAt     time.Time
 	LastRateLimitedProbeAt  time.Time
 	LastFullUsageProbeAt    time.Time
+	LastFailureStatusCode   int
+	LastFailureCode         string
+	LastFailureMessage      string
 
 	// 滑动窗口成功率（最近 N 次请求）
 	RecentResults    [20]uint8 // 1=成功, 0=失败
@@ -485,6 +488,31 @@ func (a *Account) GetProbeTimestamps() (rateLimitedAt time.Time, fullUsageAt tim
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.LastRateLimitedProbeAt, a.LastFullUsageProbeAt
+}
+
+// SetLastFailureDetail 设置最近一次失败详情（用于前端展示）
+func (a *Account) SetLastFailureDetail(statusCode int, code string, message string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.LastFailureStatusCode = statusCode
+	a.LastFailureCode = strings.TrimSpace(code)
+	a.LastFailureMessage = strings.TrimSpace(message)
+}
+
+// ClearLastFailureDetail 清空最近一次失败详情
+func (a *Account) ClearLastFailureDetail() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.LastFailureStatusCode = 0
+	a.LastFailureCode = ""
+	a.LastFailureMessage = ""
+}
+
+// GetLastFailureDetail 获取最近一次失败详情
+func (a *Account) GetLastFailureDetail() (statusCode int, code string, message string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.LastFailureStatusCode, a.LastFailureCode, a.LastFailureMessage
 }
 
 // IsBanned 检查账号是否处于强隔离状态
@@ -1625,6 +1653,9 @@ func (s *Store) ReportRequestSuccess(acc *Account, latency time.Duration) {
 	acc.LastSuccessAt = time.Now()
 	acc.SuccessStreak = clampInt(acc.SuccessStreak+1, 0, 20)
 	acc.FailureStreak = 0
+	acc.LastFailureStatusCode = 0
+	acc.LastFailureCode = ""
+	acc.LastFailureMessage = ""
 	if acc.HealthTier == "" {
 		acc.HealthTier = HealthTierHealthy
 	}
