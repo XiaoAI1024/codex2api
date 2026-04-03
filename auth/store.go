@@ -2348,6 +2348,11 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	expiredCooldown := acc.Status == StatusCooldown && !time.Now().Before(acc.CooldownUtil) && !rateLimitedHold
 	acc.mu.RUnlock()
 
+	// RT 刷新优先使用账号自带代理；为空时回退到代理池/全局代理。
+	if strings.TrimSpace(proxy) == "" {
+		proxy = s.NextProxy()
+	}
+
 	// 1. 尝试从缓存读取 AT
 	cachedToken, err := s.tokenCache.GetAccessToken(ctx, dbID)
 	if err == nil && cachedToken != "" {

@@ -67,6 +67,17 @@ function formatWaitPoint(dateStr?: string): string {
   return `${month}-${day} ${hour}:${minute}`
 }
 
+function clampUsagePercent(value?: number | null): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return 0
+  }
+  return Math.min(100, Math.max(0, value))
+}
+
+function roundTo2(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
 export default function Accounts() {
   const { t } = useTranslation()
   const [showAdd, setShowAdd] = useState(false)
@@ -160,6 +171,16 @@ export default function Accounts() {
   const healthyAccounts = accounts.filter((account) => account.health_tier === 'healthy').length
   const warmAccounts = accounts.filter((account) => account.health_tier === 'warm').length
   const riskyAccounts = accounts.filter((account) => account.health_tier === 'risky').length
+  const quotaSourceAccounts = accounts.filter((account) => account.status !== 'unauthorized')
+  const quotaAccountCount = quotaSourceAccounts.length
+  const quotaTotal = quotaAccountCount * 100
+  const quotaUsed = Math.round(
+    quotaSourceAccounts.reduce((sum, account) => sum + clampUsagePercent(account.usage_percent_7d), 0)
+  )
+  const quotaRemaining = Math.max(0, quotaTotal - quotaUsed)
+  const quotaUsedPercent = quotaTotal > 0 ? roundTo2((quotaUsed / quotaTotal) * 100) : 0
+  const quotaRemainingPercent = quotaTotal > 0 ? roundTo2((quotaRemaining / quotaTotal) * 100) : 0
+  const quotaRemainingAccounts = roundTo2(quotaRemaining / 100)
 
   const filteredAccounts = accounts.filter((account) => {
     // 状态过滤
@@ -745,6 +766,17 @@ export default function Accounts() {
           <CompactStat label={t('accounts.rateLimited')} chipLabel={t('accounts.filterRateLimited')} value={rateLimitedAccounts} tone="warning" />
           <CompactStat label={t('accounts.fullUsageAccounts')} chipLabel={t('accounts.filterFullUsage')} value={fullUsageAccounts} tone="warning" />
           <CompactStat label={t('accounts.bannedAccounts')} chipLabel={t('accounts.filterBanned')} value={bannedAccounts} tone="danger" />
+        </div>
+
+        <div className="mb-2 text-[12px] font-semibold text-muted-foreground">{t('accounts.quotaSectionTitle')}</div>
+        <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
+          <CompactStat label={t('accounts.quotaAccountCount')} value={quotaAccountCount} tone="neutral" />
+          <CompactStat label={t('accounts.quotaTotal')} value={quotaTotal.toLocaleString()} tone="neutral" />
+          <CompactStat label={t('accounts.quotaUsed')} value={quotaUsed.toLocaleString()} tone="warning" />
+          <CompactStat label={t('accounts.quotaRemaining')} value={quotaRemaining.toLocaleString()} tone="success" />
+          <CompactStat label={t('accounts.quotaUsedPercent')} value={`${quotaUsedPercent.toFixed(2)}%`} tone="warning" />
+          <CompactStat label={t('accounts.quotaRemainingPercent')} value={`${quotaRemainingPercent.toFixed(2)}%`} tone="success" />
+          <CompactStat label={t('accounts.quotaRemainingAccounts')} value={quotaRemainingAccounts.toFixed(2)} tone="success" />
         </div>
 
         <div className="mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-border bg-white/55 px-4 py-3 text-[12px] text-muted-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.72)]">
@@ -1445,7 +1477,7 @@ function CompactStat({
 }: {
   label: string
   chipLabel?: string
-  value: number
+  value: number | string
   tone: 'neutral' | 'success' | 'warning' | 'danger'
 }) {
   const toneStyle = {
