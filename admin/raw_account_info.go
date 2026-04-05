@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -21,7 +22,14 @@ import (
 
 const whamAccountCheckURL = "https://chatgpt.com/backend-api/wham/accounts/check"
 
-// GetAccountRawInfo 实时请求上游获取账号原始信息，并同步刷新数据库字段
+type cliproxyProfile struct {
+	Email      string
+	AccountID  string
+	PlanType   string
+	PlanSource string
+}
+
+// GetAccountRawInfo 获取账号一手信息：以 CPA/CLIProxyAPI 口径为主，附带上游 wham 原始响应。
 // GET /api/admin/accounts/:id/raw-info
 func (h *Handler) GetAccountRawInfo(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
@@ -44,10 +52,11 @@ func (h *Handler) GetAccountRawInfo(c *gin.Context) {
 	account.Mu().RLock()
 	hasAccessToken := strings.TrimSpace(account.AccessToken) != ""
 	hasRefreshToken := strings.TrimSpace(account.RefreshToken) != ""
+	currentPlan := strings.TrimSpace(account.PlanType)
 	account.Mu().RUnlock()
 	needsRefresh := account.NeedsRefresh()
 
-	// 无可用 AT 或即将过期时先刷新，避免上游鉴权失败
+	// 对齐 CPA：优先保证 token 为最新状态
 	if (!hasAccessToken || needsRefresh) && hasRefreshToken {
 		refreshCtx, cancel := context.WithTimeout(c.Request.Context(), 45*time.Second)
 		defer cancel()
@@ -56,10 +65,8 @@ func (h *Handler) GetAccountRawInfo(c *gin.Context) {
 			return
 		}
 	} else if !hasAccessToken {
-		if !hasRefreshToken {
-			writeError(c, http.StatusBadRequest, "账号没有可用的 Access Token，且缺少 Refresh Token")
-			return
-		}
+		writeError(c, http.StatusBadRequest, "账号没有可用的 Access Token，且缺少 Refresh Token")
+		return
 	}
 
 	account.Mu().RLock()
@@ -73,22 +80,41 @@ func (h *Handler) GetAccountRawInfo(c *gin.Context) {
 		return
 	}
 
-	// 代理池优先（与测试连接一致），否则回退账号自带代理
 	proxyURL := strings.TrimSpace(h.store.NextProxy())
 	if proxyURL == "" {
 		proxyURL = accountProxy
 	}
 
-	reqCtx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
-	defer cancel()
-
-	rawBody, statusCode, err := requestWhamAccountCheck(reqCtx, accessToken, accountID, proxyURL)
+	rowCtx, rowCancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
+	defer rowCancel()
+	row, err := h.db.GetAccountByID(rowCtx, id)
 	if err != nil {
-		if len(rawBody) > 0 {
-			errCode := strings.TrimSpace(gjson.GetBytes(rawBody, "error.code").String())
-			errMsg := strings.TrimSpace(gjson.GetBytes(rawBody, "error.message").String())
+		writeInternalError(c, fmt.Errorf("读取账号凭据失败: %w", err))
+		return
+	}
+
+	profile := resolveCliproxyProfile(row)
+	if !hasCliproxyProfile(profile) {
+		profile = resolveRuntimeProfile(account)
+	}
+
+	reqCtx, reqCancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer reqCancel()
+
+	var (
+		upstreamRawBody    []byte
+		upstreamParsedBody any
+		upstreamErr        error
+	)
+
+	upstreamRawBody, statusCode, reqErr := requestWhamAccountCheck(reqCtx, accessToken, accountID, proxyURL)
+	if reqErr != nil {
+		upstreamErr = reqErr
+		if len(upstreamRawBody) > 0 {
+			errCode := strings.TrimSpace(gjson.GetBytes(upstreamRawBody, "error.code").String())
+			errMsg := strings.TrimSpace(gjson.GetBytes(upstreamRawBody, "error.message").String())
 			if errMsg == "" {
-				errMsg = strings.TrimSpace(gjson.GetBytes(rawBody, "message").String())
+				errMsg = strings.TrimSpace(gjson.GetBytes(upstreamRawBody, "message").String())
 			}
 			account.SetLastFailureDetail(statusCode, errCode, errMsg)
 			switch statusCode {
@@ -100,17 +126,16 @@ func (h *Handler) GetAccountRawInfo(c *gin.Context) {
 				}
 			}
 		}
-		writeError(c, http.StatusBadGateway, err.Error())
-		return
+	} else {
+		if err := json.Unmarshal(upstreamRawBody, &upstreamParsedBody); err != nil {
+			upstreamErr = fmt.Errorf("上游返回了非 JSON 数据")
+		} else {
+			account.ClearLastFailureDetail()
+		}
 	}
 
-	var raw any
-	if err := json.Unmarshal(rawBody, &raw); err != nil {
-		writeError(c, http.StatusBadGateway, "上游返回了非 JSON 数据")
-		return
-	}
-
-	refreshedFields, credentialUpdates := extractCredentialUpdatesFromRawInfo(rawBody)
+	upstreamFields, _ := extractCredentialUpdatesFromRawInfo(upstreamRawBody)
+	refreshedFields, credentialUpdates := mergeCredentialRefresh(profile, upstreamFields, currentPlan)
 	credentialUpdates["raw_info_refreshed_at"] = time.Now().UTC().Format(time.RFC3339)
 
 	dbCtx, dbCancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
@@ -121,15 +146,29 @@ func (h *Handler) GetAccountRawInfo(c *gin.Context) {
 	}
 
 	applyRawInfoToRuntimeAccount(account, refreshedFields)
-	account.ClearLastFailureDetail()
 	h.db.InsertAccountEventAsync(id, "raw_info_refreshed", "manual")
+
+	if upstreamErr != nil && !hasCliproxyProfile(profile) {
+		writeError(c, http.StatusBadGateway, upstreamErr.Error())
+		return
+	}
+
+	rawPayload := gin.H{
+		"cliproxyapi_profile": buildCliproxyProfilePayload(profile),
+	}
+	if upstreamParsedBody != nil {
+		rawPayload["upstream_wham_accounts_check"] = upstreamParsedBody
+	}
+	if upstreamErr != nil {
+		rawPayload["upstream_wham_accounts_check_error"] = upstreamErr.Error()
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":          "账号原始信息获取成功",
-		"source":           "upstream",
+		"source":           "cliproxyapi",
 		"fetched_at":       time.Now().UTC().Format(time.RFC3339),
 		"refreshed_fields": refreshedFields,
-		"raw":              raw,
+		"raw":              rawPayload,
 	})
 }
 
@@ -205,7 +244,141 @@ func cloneHTTPTransport() *http.Transport {
 	return &http.Transport{}
 }
 
+func resolveCliproxyProfile(row *database.AccountRow) cliproxyProfile {
+	if row == nil {
+		return cliproxyProfile{}
+	}
+
+	result := cliproxyProfile{}
+	credEmail := strings.TrimSpace(row.GetCredential("email"))
+	credAccountID := strings.TrimSpace(row.GetCredential("account_id"))
+	credPlan := auth.NormalizePlanType(strings.TrimSpace(row.GetCredential("plan_type")))
+
+	if credEmail != "" {
+		result.Email = credEmail
+	}
+	if credAccountID != "" {
+		result.AccountID = credAccountID
+	}
+
+	plan := ""
+	planSource := ""
+	applyPlan := func(candidate string, source string) {
+		candidate = auth.NormalizePlanType(candidate)
+		if candidate == "" {
+			return
+		}
+		next := auth.PreferPlanType(plan, candidate)
+		if next != plan {
+			plan = next
+			planSource = source
+		}
+	}
+
+	if credPlan != "" {
+		applyPlan(credPlan, "credentials.plan_type")
+	}
+
+	if accessToken := strings.TrimSpace(row.GetCredential("access_token")); accessToken != "" {
+		if info := auth.ParseAccessToken(accessToken); info != nil {
+			if result.Email == "" && strings.TrimSpace(info.Email) != "" {
+				result.Email = strings.TrimSpace(info.Email)
+			}
+			if result.AccountID == "" && strings.TrimSpace(info.ChatGPTAccountID) != "" {
+				result.AccountID = strings.TrimSpace(info.ChatGPTAccountID)
+			}
+			applyPlan(info.PlanType, "access_token.chatgpt_plan_type")
+		}
+	}
+
+	if idToken := strings.TrimSpace(row.GetCredential("id_token")); idToken != "" {
+		if info := auth.ParseIDToken(idToken); info != nil {
+			if strings.TrimSpace(info.Email) != "" {
+				result.Email = strings.TrimSpace(info.Email)
+			}
+			if strings.TrimSpace(info.ChatGPTAccountID) != "" {
+				result.AccountID = strings.TrimSpace(info.ChatGPTAccountID)
+			}
+			applyPlan(info.PlanType, "id_token.chatgpt_plan_type")
+		}
+	}
+
+	result.PlanType = plan
+	result.PlanSource = planSource
+	return result
+}
+
+func resolveRuntimeProfile(account *auth.Account) cliproxyProfile {
+	if account == nil {
+		return cliproxyProfile{}
+	}
+	account.Mu().RLock()
+	defer account.Mu().RUnlock()
+	return cliproxyProfile{
+		Email:      strings.TrimSpace(account.Email),
+		AccountID:  strings.TrimSpace(account.AccountID),
+		PlanType:   auth.NormalizePlanType(account.PlanType),
+		PlanSource: "runtime.account",
+	}
+}
+
+func hasCliproxyProfile(profile cliproxyProfile) bool {
+	return strings.TrimSpace(profile.Email) != "" ||
+		strings.TrimSpace(profile.AccountID) != "" ||
+		strings.TrimSpace(profile.PlanType) != ""
+}
+
+func buildCliproxyProfilePayload(profile cliproxyProfile) gin.H {
+	return gin.H{
+		"email":       profile.Email,
+		"account_id":  profile.AccountID,
+		"plan_type":   profile.PlanType,
+		"plan_source": profile.PlanSource,
+	}
+}
+
+func mergeCredentialRefresh(profile cliproxyProfile, upstream map[string]string, currentPlan string) (map[string]string, map[string]interface{}) {
+	refreshed := make(map[string]string, 3)
+	updates := make(map[string]interface{}, 3)
+
+	email := strings.TrimSpace(profile.Email)
+	if email == "" {
+		email = strings.TrimSpace(upstream["email"])
+	}
+	if email != "" {
+		refreshed["email"] = email
+		updates["email"] = email
+	}
+
+	accountID := strings.TrimSpace(profile.AccountID)
+	if accountID == "" {
+		accountID = strings.TrimSpace(upstream["account_id"])
+	}
+	if accountID != "" {
+		refreshed["account_id"] = accountID
+		updates["account_id"] = accountID
+	}
+
+	selectedPlan := auth.NormalizePlanType(strings.TrimSpace(currentPlan))
+	if candidate := strings.TrimSpace(profile.PlanType); candidate != "" {
+		selectedPlan = auth.PreferPlanType(selectedPlan, candidate)
+	}
+	if candidate := strings.TrimSpace(upstream["plan_type"]); candidate != "" {
+		selectedPlan = auth.PreferPlanType(selectedPlan, candidate)
+	}
+	if selectedPlan != "" {
+		refreshed["plan_type"] = selectedPlan
+		updates["plan_type"] = selectedPlan
+	}
+
+	return refreshed, updates
+}
+
 func extractCredentialUpdatesFromRawInfo(rawBody []byte) (map[string]string, map[string]interface{}) {
+	if len(rawBody) == 0 {
+		return map[string]string{}, map[string]interface{}{}
+	}
+
 	email := firstNonEmptyJSONValue(rawBody,
 		"email",
 		"user.email",
@@ -213,6 +386,7 @@ func extractCredentialUpdatesFromRawInfo(rawBody []byte) (map[string]string, map
 		"account.email",
 		"data.email",
 	)
+	defaultAccountID := firstNonEmptyJSONValue(rawBody, "default_account_id")
 	accountID := firstNonEmptyJSONValue(rawBody,
 		"chatgpt_account_id",
 		"account_id",
@@ -220,6 +394,13 @@ func extractCredentialUpdatesFromRawInfo(rawBody []byte) (map[string]string, map
 		"account.chatgpt_account_id",
 		"data.account_id",
 	)
+	if accountID == "" {
+		accountID = defaultAccountID
+	}
+	if accountID == "" {
+		accountID = firstNonEmptyJSONValue(rawBody, "accounts.0.id")
+	}
+
 	planTypeRaw := firstNonEmptyJSONValue(rawBody,
 		"plan_type",
 		"chatgpt_plan_type",
@@ -231,6 +412,15 @@ func extractCredentialUpdatesFromRawInfo(rawBody []byte) (map[string]string, map
 		"subscription.chatgpt_plan_type",
 		"data.plan_type",
 	)
+
+	if planTypeRaw == "" && defaultAccountID != "" {
+		escaped := escapeForGJSONLiteral(defaultAccountID)
+		path := fmt.Sprintf(`accounts.#(id=="%s").plan_type`, escaped)
+		planTypeRaw = strings.TrimSpace(gjson.GetBytes(rawBody, path).String())
+	}
+	if planTypeRaw == "" {
+		planTypeRaw = firstNonEmptyJSONValue(rawBody, "accounts.0.plan_type")
+	}
 
 	refreshed := make(map[string]string, 3)
 	updates := make(map[string]interface{}, 3)
@@ -260,6 +450,11 @@ func firstNonEmptyJSONValue(rawBody []byte, paths ...string) string {
 		}
 	}
 	return ""
+}
+
+func escapeForGJSONLiteral(value string) string {
+	replacer := strings.NewReplacer(`\\`, `\\\\`, `"`, `\\"`)
+	return replacer.Replace(value)
 }
 
 func applyRawInfoToRuntimeAccount(account *auth.Account, refreshed map[string]string) {

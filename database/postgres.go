@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -1678,6 +1679,66 @@ func (db *DB) ListAll(ctx context.Context) ([]*AccountRow, error) {
 		accounts = append(accounts, a)
 	}
 	return accounts, rows.Err()
+}
+
+// GetAccountByID 按 ID 获取账号（包含 credentials）
+func (db *DB) GetAccountByID(ctx context.Context, id int64) (*AccountRow, error) {
+	query := `
+		SELECT a.id, a.name, a.platform, a.type, a.credentials, a.proxy_url,
+		       a.public_api_key_id,
+		       COALESCE(s.settled_amount_usd, 0) AS settled_amount_usd,
+		       a.status, a.cooldown_reason, a.cooldown_until,
+		       COALESCE(a.error_message, '') AS error_message,
+		       a.created_at, a.updated_at
+		FROM accounts a
+		LEFT JOIN public_account_settlements s ON s.account_id = a.id
+		WHERE a.id = $1
+		LIMIT 1
+	`
+
+	row := db.conn.QueryRowContext(ctx, query, id)
+	a := &AccountRow{}
+	var credRaw interface{}
+	var cooldownUntilRaw interface{}
+	var createdAtRaw interface{}
+	var updatedAtRaw interface{}
+	if err := row.Scan(
+		&a.ID,
+		&a.Name,
+		&a.Platform,
+		&a.Type,
+		&credRaw,
+		&a.ProxyURL,
+		&a.PublicAPIKeyID,
+		&a.SettledAmount,
+		&a.Status,
+		&a.CooldownReason,
+		&cooldownUntilRaw,
+		&a.ErrorMessage,
+		&createdAtRaw,
+		&updatedAtRaw,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("查询账号失败: %w", err)
+	}
+
+	var err error
+	a.Credentials = decodeCredentials(credRaw)
+	a.CooldownUntil, err = parseDBNullTimeValue(cooldownUntilRaw)
+	if err != nil {
+		return nil, fmt.Errorf("解析 cooldown_until 失败: %w", err)
+	}
+	a.CreatedAt, err = parseDBTimeValue(createdAtRaw)
+	if err != nil {
+		return nil, fmt.Errorf("解析 created_at 失败: %w", err)
+	}
+	a.UpdatedAt, err = parseDBTimeValue(updatedAtRaw)
+	if err != nil {
+		return nil, fmt.Errorf("解析 updated_at 失败: %w", err)
+	}
+	return a, nil
 }
 
 // UpdateCredentials 原子合并更新账号的 credentials（JSONB || 运算符，不覆盖已有字段）
