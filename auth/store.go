@@ -622,7 +622,28 @@ func (a *Account) GetReset7dAt() time.Time {
 func (a *Account) GetPlanType() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.PlanType
+	return NormalizePlanType(a.PlanType)
+}
+
+// MaybeUpgradePlanTypeFromUsage 根据用量窗口兜底推断套餐（仅在未知/free 时升级为 plus）。
+func (a *Account) MaybeUpgradePlanTypeFromUsage() (string, bool) {
+	if a == nil {
+		return "", false
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	current := NormalizePlanType(a.PlanType)
+	if current != "" && current != "free" {
+		return current, false
+	}
+	if !a.UsagePercent5hValid || !a.UsagePercent7dValid {
+		return current, false
+	}
+
+	a.PlanType = "plus"
+	return "plus", true
 }
 
 // GetHealthTier 获取当前健康层级
@@ -1203,7 +1224,7 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 			account.AccessToken = at
 			account.AccountID = row.GetCredential("account_id")
 			account.Email = row.GetCredential("email")
-			account.PlanType = row.GetCredential("plan_type")
+			account.PlanType = NormalizePlanType(row.GetCredential("plan_type"))
 			account.HealthTier = HealthTierHealthy
 			if expiresAt := row.GetCredential("expires_at"); expiresAt != "" {
 				if parsed, err := time.Parse(time.RFC3339, expiresAt); err == nil {
@@ -1800,6 +1821,15 @@ func (s *Store) PersistUsageSnapshot(acc *Account, pct7d float64) {
 
 	if s.db == nil {
 		return
+	}
+
+	// 兜底：当观测到 5h+7d 双窗口但套餐仍为 free/未知时，升级标记为 plus。
+	if inferredPlan, changed := acc.MaybeUpgradePlanTypeFromUsage(); changed {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{"plan_type": inferredPlan}); err != nil {
+			log.Printf("[账号 %d] 持久化套餐推断失败: %v", acc.DBID, err)
+		}
+		cancel()
 	}
 
 	// 如果有 5h 数据，使用完整存储
@@ -2490,7 +2520,7 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	if info != nil {
 		acc.AccountID = info.ChatGPTAccountID
 		acc.Email = info.Email
-		acc.PlanType = info.PlanType
+		acc.PlanType = NormalizePlanType(info.PlanType)
 	}
 	if activeCooldown {
 		acc.Status = StatusCooldown
@@ -2521,7 +2551,7 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	if info != nil {
 		credentials["account_id"] = info.ChatGPTAccountID
 		credentials["email"] = info.Email
-		credentials["plan_type"] = info.PlanType
+		credentials["plan_type"] = NormalizePlanType(info.PlanType)
 	}
 	if err := s.db.UpdateCredentials(ctx, dbID, credentials); err != nil {
 		log.Printf("[账号 %d] 更新数据库失败: %v", dbID, err)

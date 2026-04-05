@@ -95,8 +95,23 @@ func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL strin
 		td.RefreshToken = refreshToken
 	}
 
-	// 解析 id_token 获取账号信息
+	// 解析 id_token / access_token 获取账号信息（两者口径不同，取更可信套餐值）
 	info := parseIDToken(tokenResp.IDToken)
+	if atInfo := ParseAccessToken(td.AccessToken); atInfo != nil {
+		if info == nil {
+			info = &AccountInfo{}
+		}
+		if strings.TrimSpace(info.Email) == "" {
+			info.Email = strings.TrimSpace(atInfo.Email)
+		}
+		if strings.TrimSpace(info.ChatGPTAccountID) == "" {
+			info.ChatGPTAccountID = strings.TrimSpace(atInfo.ChatGPTAccountID)
+		}
+		info.PlanType = PreferPlanType(atInfo.PlanType, info.PlanType)
+	}
+	if info != nil {
+		info.PlanType = NormalizePlanType(info.PlanType)
+	}
 
 	return td, info, nil
 }
@@ -183,7 +198,7 @@ func parseIDToken(idToken string) *AccountInfo {
 	info := &AccountInfo{Email: claims.Email}
 	if claims.OpenAIAuth != nil {
 		info.ChatGPTAccountID = claims.OpenAIAuth.ChatGPTAccountID
-		info.PlanType = claims.OpenAIAuth.PlanType
+		info.PlanType = NormalizePlanType(claims.OpenAIAuth.PlanType)
 	}
 	return info
 }
@@ -225,8 +240,8 @@ func ParseAccessToken(accessToken string) *AccessTokenInfo {
 	}
 
 	var claims struct {
-		Exp            int64 `json:"exp"`
-		OpenAIAuth    *struct {
+		Exp        int64 `json:"exp"`
+		OpenAIAuth *struct {
 			ChatGPTAccountID string `json:"chatgpt_account_id"`
 			PlanType         string `json:"chatgpt_plan_type"`
 		} `json:"https://api.openai.com/auth"`
@@ -244,7 +259,7 @@ func ParseAccessToken(accessToken string) *AccessTokenInfo {
 	}
 	if claims.OpenAIAuth != nil {
 		info.ChatGPTAccountID = claims.OpenAIAuth.ChatGPTAccountID
-		info.PlanType = claims.OpenAIAuth.PlanType
+		info.PlanType = NormalizePlanType(claims.OpenAIAuth.PlanType)
 	}
 	if claims.Exp > 0 {
 		info.ExpiresAt = time.Unix(claims.Exp, 0)
@@ -265,7 +280,7 @@ func (e *authPoolEntry) touch() {
 }
 
 const (
-	authClientPoolTTL         = 5 * time.Minute
+	authClientPoolTTL             = 5 * time.Minute
 	authClientPoolCleanupInterval = 60 * time.Second
 )
 
@@ -338,8 +353,6 @@ func buildHTTPClient(proxyURL string) *http.Client {
 	}
 	return client
 }
-
-
 
 // BuildHTTPClient builds a proxy-aware HTTP client (exported for admin OAuth flow).
 func BuildHTTPClient(proxyURL string) *http.Client {

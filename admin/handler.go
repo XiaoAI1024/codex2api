@@ -311,7 +311,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			ID:                  row.ID,
 			Name:                row.Name,
 			Email:               row.GetCredential("email"),
-			PlanType:            row.GetCredential("plan_type"),
+			PlanType:            auth.NormalizePlanType(row.GetCredential("plan_type")),
 			SettlementAmountUSD: row.SettledAmount,
 			Status:              row.Status,
 			ATOnly:              row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
@@ -324,6 +324,9 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			resp.UploaderID = &uploaderID
 		}
 		if acc, ok := accountMap[row.ID]; ok {
+			if plan := strings.TrimSpace(acc.GetPlanType()); plan != "" {
+				resp.PlanType = plan
+			}
 			resp.ActiveRequests = acc.GetActiveRequests()
 			resp.TotalRequests = acc.GetTotalRequests()
 			debug := acc.GetSchedulerDebugSnapshot(int64(h.store.GetMaxConcurrency()))

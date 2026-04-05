@@ -561,8 +561,24 @@ func parseCompatEntry(entry map[string]interface{}) compatEntry {
 	parsed.idToken = compatString(entry, "id_token", "idToken")
 	parsed.email = compatString(entry, "email", "account_email", "accountEmail")
 	parsed.accountID = compatString(entry, "account_id", "accountId", "chatgpt_account_id", "chatgptAccountId")
-	parsed.planType = compatString(entry, "plan_type", "planType")
+	parsed.planType = compatString(entry, "plan_type", "planType", "chatgpt_plan_type")
 	parsed.proxyURL = compatString(entry, "proxy_url", "proxyUrl", "proxy")
+
+	if rawAuth, ok := entry["https://api.openai.com/auth"]; ok {
+		if authMap, ok := rawAuth.(map[string]interface{}); ok {
+			if parsed.accountID == "" {
+				parsed.accountID = compatString(authMap, "chatgpt_account_id", "account_id", "accountId")
+			}
+			if parsed.planType == "" {
+				parsed.planType = compatString(authMap, "chatgpt_plan_type", "plan_type", "planType")
+			}
+		}
+	}
+	if rawProfile, ok := entry["https://api.openai.com/profile"]; ok {
+		if profileMap, ok := rawProfile.(map[string]interface{}); ok && parsed.email == "" {
+			parsed.email = compatString(profileMap, "email")
+		}
+	}
 
 	parsed.expiresRaw = compatString(entry, "expires_at", "expiresAt", "expired")
 	if ts, ok := parseCompatTime(parsed.expiresRaw); ok {
@@ -603,6 +619,7 @@ func parseCompatEntry(entry map[string]interface{}) compatEntry {
 			}
 		}
 	}
+	parsed.planType = auth.NormalizePlanType(parsed.planType)
 
 	return parsed
 }
