@@ -235,7 +235,10 @@ func main() {
 	log.Printf("  管理台: http://0.0.0.0%s/admin/", addr)
 	log.Printf("  API:    POST /v1/chat/completions")
 	log.Printf("  API:    POST /v1/responses")
+	log.Printf("  API:    POST /v1/responses/compact (compat)")
 	log.Printf("  API:    GET  /v1/models")
+	log.Printf("  Compat: POST /chat/completions, /responses, /responses/compact")
+	log.Printf("  Compat: GET  /models")
 	log.Println("==========================================")
 
 	// 优雅关闭

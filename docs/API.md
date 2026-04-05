@@ -17,7 +17,9 @@
 
 Codex2API 提供兼容 OpenAI 风格的 API 接口，同时包含完整的管理后台 API。
 
-**Base URL:** `http://localhost:8080` (默认端口)
+**推荐 Base URL:** `http://localhost:8080/v1`
+
+**兼容 Base URL:** `http://localhost:8080`（当客户端不方便携带 `/v1` 前缀时，可直接使用根路径兼容路由）
 
 **请求格式:**
 - 请求头: `Content-Type: application/json`
@@ -68,6 +70,8 @@ Authorization: Bearer your-admin-secret
 **端点:** `POST /v1/chat/completions`
 
 **说明:** OpenAI 风格的 Chat Completions 接口，支持流式和非流式响应。
+
+**兼容端点:** `POST /chat/completions`
 
 **请求示例:**
 ```json
@@ -139,6 +143,8 @@ data: [DONE]
 
 **说明:** Codex 原生 Responses 接口，直接透传，无需协议翻译。
 
+**兼容端点:** `POST /responses`、`POST /v1/responses/compact`、`POST /responses/compact`（`compact` 路径等同于 `/v1/responses`，用于兼容部分客户端 compact 请求）
+
 **请求示例:**
 ```json
 {
@@ -200,6 +206,8 @@ data: [DONE]
 **端点:** `GET /v1/models`
 
 **说明:** 获取支持的模型列表。
+
+**兼容端点:** `GET /models`
 
 **响应示例:**
 ```json

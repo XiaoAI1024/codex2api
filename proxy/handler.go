@@ -289,11 +289,24 @@ func shouldUseWebsocketTransport(cfg *config.Config, req *http.Request) bool {
 
 // RegisterRoutes 注册路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
+	registerOpenAIRoutes := func(group *gin.RouterGroup) {
+		group.POST("/chat/completions", h.ChatCompletions)
+		group.POST("/responses", h.Responses)
+		// 兼容部分客户端将 compact 请求打到 /responses/compact。
+		group.POST("/responses/compact", h.Responses)
+		group.GET("/models", h.ListModels)
+	}
+
+	authMW := h.authMiddleware()
+
 	v1 := r.Group("/v1")
-	v1.Use(h.authMiddleware())
-	v1.POST("/chat/completions", h.ChatCompletions)
-	v1.POST("/responses", h.Responses)
-	v1.GET("/models", h.ListModels)
+	v1.Use(authMW)
+	registerOpenAIRoutes(v1)
+
+	// 兼容无版本前缀路径（如 base_url 不含 /v1 的客户端配置）。
+	compat := r.Group("")
+	compat.Use(authMW)
+	registerOpenAIRoutes(compat)
 }
 
 // authMiddleware API Key 鉴权中间件（增强版，带安全日志）

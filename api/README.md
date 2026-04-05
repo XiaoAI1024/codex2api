@@ -69,10 +69,13 @@ Rate limits are returned in response headers:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/v1/models` | GET | List available models |
-| `/v1/chat/completions` | POST | Create chat completion |
-| `/v1/responses` | POST | Create response (Codex native) |
+| `/v1/models` | GET | List available models (root-path alias: `/models`) |
+| `/v1/chat/completions` | POST | Create chat completion (root-path alias: `/chat/completions`) |
+| `/v1/responses` | POST | Create response (Codex native, root-path alias: `/responses`) |
+| `/v1/responses/compact` | POST | Compact compatibility alias (same as `/v1/responses`, root-path alias: `/responses/compact`) |
 | `/health` | GET | Health check |
+
+If your client uses a `base_url` without `/v1`, the same OpenAI-compatible endpoints are also available on the root paths listed above.
 
 ### Model Support
 

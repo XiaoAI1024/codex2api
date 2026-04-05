@@ -24,9 +24,13 @@ info:
 
 servers:
   - url: http://localhost:8080/v1
-    description: Local development server
+    description: Local development server (recommended versioned base URL)
+  - url: http://localhost:8080
+    description: Local development server (root-path compatibility base URL)
   - url: https://api.codex2api.local/v1
-    description: Production server
+    description: Production server (recommended versioned base URL)
+  - url: https://api.codex2api.local
+    description: Production server (root-path compatibility base URL)
 
 security:
   - BearerAuth: []
@@ -502,6 +506,63 @@ paths:
         Creates a response using the native Codex Responses API.
         Provides direct access to Codex functionality.
       operationId: createResponse
+      tags:
+        - Responses
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResponsesRequest'
+      responses:
+        '200':
+          description: Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResponsesResponse'
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /responses/compact:
+    post:
+      summary: Create compact response (compatibility alias)
+      description: |
+        Compatibility alias for clients that send context compaction requests
+        to `/responses/compact`.
+        This endpoint is handled the same way as `/responses`.
+      operationId: createResponseCompact
       tags:
         - Responses
       requestBody:
