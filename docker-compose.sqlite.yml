@@ -6,6 +6,7 @@ services:
     container_name: codex2api-sqlite
     ports:
       - "${CODEX_PORT:-8080}:${CODEX_PORT:-8080}"
+      - "${CODEX_PLUS_PORT:-8081}:${CODEX_PLUS_PORT:-8081}"
     env_file:
       - .env
     volumes:
