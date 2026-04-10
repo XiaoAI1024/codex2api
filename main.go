@@ -325,9 +325,17 @@ func loggerMiddleware() gin.HandlerFunc {
 		tierVal, _ := c.Get("x-service-tier")
 		attemptsVal, _ := c.Get("x-upstream-attempts")
 		failedAttemptsVal, _ := c.Get("x-upstream-failed-attempts")
+		requestIDVal, _ := c.Get("x-request-id")
 		schedulerAcquireVal, _ := c.Get("x-scheduler-acquire-ms")
+		schedulerAttemptVal, _ := c.Get("x-scheduler-attempt-ms")
 		schedulerWaitRoundsVal, _ := c.Get("x-scheduler-wait-rounds")
 		upstreamStageVal, _ := c.Get("x-upstream-stage-ms")
+		upstreamHeaderVal, _ := c.Get("x-upstream-header-ms")
+		upstreamFrameVal, _ := c.Get("x-upstream-first-frame-ms")
+		upstreamFirstByteVal, _ := c.Get("x-upstream-first-byte-ms")
+		upstreamAttemptVal, _ := c.Get("x-upstream-attempt-total-ms")
+		upstreamConnectVal, _ := c.Get("x-upstream-connect-ms")
+		upstreamReusedVal, _ := c.Get("x-upstream-reused-conn")
 		firstTokenVal, _ := c.Get("x-first-token-ms")
 
 		emailStr := ""
@@ -345,6 +353,9 @@ func loggerMiddleware() gin.HandlerFunc {
 		if m, ok := modelVal.(string); ok && m != "" {
 			tags = append(tags, security.SanitizeLog(m))
 		}
+		if rid, ok := requestIDVal.(string); ok && rid != "" {
+			tags = append(tags, "rid="+security.SanitizeLog(rid))
+		}
 		if e, ok := effortVal.(string); ok && e != "" {
 			tags = append(tags, "effort="+security.SanitizeLog(e))
 		}
@@ -360,14 +371,35 @@ func loggerMiddleware() gin.HandlerFunc {
 		if acquireMs, ok := schedulerAcquireVal.(int64); ok && acquireMs >= 20 {
 			tags = append(tags, fmt.Sprintf("sched=%dms", acquireMs))
 		}
+		if attemptPickMs, ok := schedulerAttemptVal.(int); ok && attemptPickMs >= 20 {
+			tags = append(tags, fmt.Sprintf("pick=%dms", attemptPickMs))
+		}
 		if waitRounds, ok := schedulerWaitRoundsVal.(int); ok && waitRounds > 0 {
 			tags = append(tags, fmt.Sprintf("wait=%d", waitRounds))
 		}
 		if upstreamMs, ok := upstreamStageVal.(int64); ok && upstreamMs > 0 {
 			tags = append(tags, fmt.Sprintf("forward=%dms", upstreamMs))
 		}
+		if headerMs, ok := upstreamHeaderVal.(int); ok && headerMs > 0 {
+			tags = append(tags, fmt.Sprintf("header=%dms", headerMs))
+		}
+		if frameMs, ok := upstreamFrameVal.(int); ok && frameMs > 0 {
+			tags = append(tags, fmt.Sprintf("frame=%dms", frameMs))
+		}
+		if firstByteMs, ok := upstreamFirstByteVal.(int); ok && firstByteMs > 0 {
+			tags = append(tags, fmt.Sprintf("ttfb=%dms", firstByteMs))
+		}
+		if connectMs, ok := upstreamConnectVal.(int); ok && connectMs > 0 {
+			tags = append(tags, fmt.Sprintf("connect=%dms", connectMs))
+		}
+		if attemptMs, ok := upstreamAttemptVal.(int); ok && attemptMs > 0 {
+			tags = append(tags, fmt.Sprintf("attempt=%dms", attemptMs))
+		}
 		if firstMs, ok := firstTokenVal.(int); ok && firstMs > 0 {
 			tags = append(tags, fmt.Sprintf("first=%dms", firstMs))
+		}
+		if reused, ok := upstreamReusedVal.(bool); ok && reused {
+			tags = append(tags, "reused")
 		}
 		tagStr := ""
 		if len(tags) > 0 {

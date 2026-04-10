@@ -452,8 +452,12 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 	}
 
 	available := a.Status != StatusError && tier != HealthTierBanned && a.AccessToken != ""
-	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
-		available = false
+	if a.Status == StatusCooldown {
+		if a.CooldownReason == "rate_limited" {
+			available = false
+		} else if now.Before(a.CooldownUtil) {
+			available = false
+		}
 	}
 
 	return tier, score, limit, available

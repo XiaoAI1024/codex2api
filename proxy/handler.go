@@ -592,7 +592,10 @@ const (
 
 // isRetryableStatus 检查是否可重试的上游状态码
 func isRetryableStatus(code int) bool {
-	return code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable || code == http.StatusUnauthorized || code == http.StatusInternalServerError
+	if code == http.StatusUnauthorized || code == http.StatusTooManyRequests {
+		return true
+	}
+	return code >= 500 && code <= 599
 }
 
 func isPermanentUnauthorizedError(body []byte) bool {
@@ -696,6 +699,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	if serviceTier != "" {
 		c.Set("x-service-tier", serviceTier)
 	}
+	logRequestLifecycleStart(c, "/v1/responses", model, isStream, reasoningEffort)
 
 	// 2. 注入/修正 Codex 必需字段
 	codexBody := rawBody
@@ -753,7 +757,9 @@ func (h *Handler) Responses(c *gin.Context) {
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		acquireStartedAt := time.Now()
 		account := h.acquireAccountForRequest(c, excludeAccounts)
+		attemptAcquireMs := int(time.Since(acquireStartedAt).Milliseconds())
 		if account == nil {
 			if lastStatusCode != 0 && len(lastBody) > 0 {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -768,6 +774,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		start := time.Now()
 		proxyURL := h.store.NextProxy()
 		useWebsocket := shouldUseWebsocketTransport(h.cfg, c.Request)
+		logRequestDispatch(c, "/v1/responses", attempt+1, account, proxyURL, model, reasoningEffort, attemptAcquireMs)
 
 		// 提取 API Key 用于设备指纹稳定化
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -782,16 +789,24 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		resp, attemptTrace, reqErr := ExecuteRequestTraced(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 		upstreamStageMs += int64(durationMs)
 		c.Set("x-upstream-stage-ms", upstreamStageMs)
+		statusCode := 0
+		if resp != nil {
+			statusCode = resp.StatusCode
+		}
+		if attemptTrace != nil && !attemptTrace.HeaderAt.IsZero() {
+			logUpstreamAttemptHeaders(c, "/v1/responses", attempt+1, account, statusCode, attemptTrace, requestStartedAt)
+		}
 
 		if reqErr != nil {
 			if kind := classifyTransportFailure(reqErr); kind != "" {
 				failedAttempts = append(failedAttempts, kind)
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
+			logUpstreamAttemptResult(c, "/v1/responses", attempt+1, account, proxyURL, 0, durationMs, requestStartedAt, reqErr.Error())
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
 
@@ -813,6 +828,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.persistUsageAndSettleFromResponse(account, resp)
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			logUpstreamAttemptResult(c, "/v1/responses", attempt+1, account, proxyURL, resp.StatusCode, durationMs, requestStartedAt, fmt.Sprintf("http_%d", resp.StatusCode))
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
 
@@ -863,6 +879,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		c.Set("x-reasoning-effort", reasoningEffort)
 		var firstTokenMs int
 		var attemptFirstTokenMs int
+		firstFrameRecorded := false
 		var usage *UsageInfo
 		var actualServiceTier string
 		ttftRecorded := false
@@ -906,12 +923,17 @@ func (h *Handler) Responses(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				eventType := gjson.GetBytes(data, "type").String()
 				visibleEvent := isUserVisibleDeltaEvent(eventType, data)
+				if !firstFrameRecorded {
+					firstFrameRecorded = true
+					logUpstreamFirstFrame(c, "/v1/responses", attempt+1, eventType, requestStartedAt, start)
+				}
 
 				// TTFT: 记录第一个 output_text.delta 事件的时间
 				if !ttftRecorded && eventType == "response.output_text.delta" {
 					attemptFirstTokenMs = int(time.Since(start).Milliseconds())
 					firstTokenMs = int(time.Since(requestStartedAt).Milliseconds())
 					ttftRecorded = true
+					logUpstreamFirstVisible(c, "/v1/responses", attempt+1, eventType, requestStartedAt, start)
 					h.store.ReportFirstTokenLatency(account, time.Duration(attemptFirstTokenMs)*time.Millisecond)
 				}
 
@@ -966,10 +988,15 @@ func (h *Handler) Responses(c *gin.Context) {
 			var lastResponseData []byte
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				eventType := gjson.GetBytes(data, "type").String()
+				if !firstFrameRecorded {
+					firstFrameRecorded = true
+					logUpstreamFirstFrame(c, "/v1/responses", attempt+1, eventType, requestStartedAt, start)
+				}
 				if !ttftRecorded && eventType == "response.output_text.delta" {
 					attemptFirstTokenMs = int(time.Since(start).Milliseconds())
 					firstTokenMs = int(time.Since(requestStartedAt).Milliseconds())
 					ttftRecorded = true
+					logUpstreamFirstVisible(c, "/v1/responses", attempt+1, eventType, requestStartedAt, start)
 					h.store.ReportFirstTokenLatency(account, time.Duration(attemptFirstTokenMs)*time.Millisecond)
 				}
 				// 累计 delta 字符数
@@ -1010,6 +1037,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteVisibleBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
+			logUpstreamAttemptResult(c, "/v1/responses", attempt+1, account, proxyURL, outcome.logStatusCode, attemptDuration, requestStartedAt, "retry:"+outcome.failureMessage)
 			recyclePooledClientForAccount(account)
 			h.persistUsageAndSettleFromResponse(account, resp)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(attemptDuration)*time.Millisecond)
@@ -1091,6 +1119,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ReportRequestSuccess(account, schedulerLatency(attemptDuration, attemptFirstTokenMs))
 		}
+		logUpstreamAttemptResult(c, "/v1/responses", attempt+1, account, proxyURL, outcome.logStatusCode, attemptDuration, requestStartedAt, "")
 		h.store.Release(account)
 		return
 	}
@@ -1151,6 +1180,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	if serviceTier != "" {
 		c.Set("x-service-tier", serviceTier)
 	}
+	logRequestLifecycleStart(c, "/v1/chat/completions", model, isStream, reasoningEffort)
 
 	// 2. 翻译请求：OpenAI Chat → Codex Responses
 	codexBody, err := TranslateRequest(rawBody)
@@ -1171,7 +1201,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		acquireStartedAt := time.Now()
 		account := h.acquireAccountForRequest(c, excludeAccounts)
+		attemptAcquireMs := int(time.Since(acquireStartedAt).Milliseconds())
 		if account == nil {
 			if lastStatusCode != 0 && len(lastBody) > 0 {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -1186,6 +1218,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		start := time.Now()
 		proxyURL := h.store.NextProxy()
 		useWebsocket := shouldUseWebsocketTransport(h.cfg, c.Request)
+		logRequestDispatch(c, "/v1/chat/completions", attempt+1, account, proxyURL, model, reasoningEffort, attemptAcquireMs)
 
 		// 提取 API Key 用于设备指纹稳定化
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -1200,16 +1233,24 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		resp, attemptTrace, reqErr := ExecuteRequestTraced(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 		upstreamStageMs += int64(durationMs)
 		c.Set("x-upstream-stage-ms", upstreamStageMs)
+		statusCode := 0
+		if resp != nil {
+			statusCode = resp.StatusCode
+		}
+		if attemptTrace != nil && !attemptTrace.HeaderAt.IsZero() {
+			logUpstreamAttemptHeaders(c, "/v1/chat/completions", attempt+1, account, statusCode, attemptTrace, requestStartedAt)
+		}
 
 		if reqErr != nil {
 			if kind := classifyTransportFailure(reqErr); kind != "" {
 				failedAttempts = append(failedAttempts, kind)
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
+			logUpstreamAttemptResult(c, "/v1/chat/completions", attempt+1, account, proxyURL, 0, durationMs, requestStartedAt, reqErr.Error())
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
 
@@ -1231,6 +1272,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			h.persistUsageAndSettleFromResponse(account, resp)
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			logUpstreamAttemptResult(c, "/v1/chat/completions", attempt+1, account, proxyURL, resp.StatusCode, durationMs, requestStartedAt, fmt.Sprintf("http_%d", resp.StatusCode))
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
 
@@ -1281,6 +1323,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		c.Set("x-reasoning-effort", reasoningEffort)
 		var firstTokenMs int
 		var attemptFirstTokenMs int
+		firstFrameRecorded := false
 		var usage *UsageInfo
 		var actualServiceTier string
 		ttftRecorded := false
@@ -1329,10 +1372,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 				eventType := gjson.GetBytes(data, "type").String()
 				visibleEvent := isUserVisibleDeltaEvent(eventType, data)
+				if !firstFrameRecorded {
+					firstFrameRecorded = true
+					logUpstreamFirstFrame(c, "/v1/chat/completions", attempt+1, eventType, requestStartedAt, start)
+				}
 				if !ttftRecorded && strings.Contains(eventType, ".delta") {
 					attemptFirstTokenMs = int(time.Since(start).Milliseconds())
 					firstTokenMs = int(time.Since(requestStartedAt).Milliseconds())
 					ttftRecorded = true
+					logUpstreamFirstVisible(c, "/v1/chat/completions", attempt+1, eventType, requestStartedAt, start)
 					h.store.ReportFirstTokenLatency(account, time.Duration(attemptFirstTokenMs)*time.Millisecond)
 				}
 				// 累计 delta 字符数（文本 + function call 参数）
@@ -1413,10 +1461,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				eventType := gjson.GetBytes(data, "type").String()
+				if !firstFrameRecorded {
+					firstFrameRecorded = true
+					logUpstreamFirstFrame(c, "/v1/chat/completions", attempt+1, eventType, requestStartedAt, start)
+				}
 				if !ttftRecorded && strings.Contains(eventType, ".delta") {
 					attemptFirstTokenMs = int(time.Since(start).Milliseconds())
 					firstTokenMs = int(time.Since(requestStartedAt).Milliseconds())
 					ttftRecorded = true
+					logUpstreamFirstVisible(c, "/v1/chat/completions", attempt+1, eventType, requestStartedAt, start)
 					h.store.ReportFirstTokenLatency(account, time.Duration(attemptFirstTokenMs)*time.Millisecond)
 				}
 				switch eventType {
@@ -1486,6 +1539,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteVisibleBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
+			logUpstreamAttemptResult(c, "/v1/chat/completions", attempt+1, account, proxyURL, outcome.logStatusCode, attemptDuration, requestStartedAt, "retry:"+outcome.failureMessage)
 			recyclePooledClientForAccount(account)
 			h.persistUsageAndSettleFromResponse(account, resp)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(attemptDuration)*time.Millisecond)
@@ -1567,6 +1621,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ReportRequestSuccess(account, schedulerLatency(attemptDuration, attemptFirstTokenMs))
 		}
+		logUpstreamAttemptResult(c, "/v1/chat/completions", attempt+1, account, proxyURL, outcome.logStatusCode, attemptDuration, requestStartedAt, "")
 		h.store.Release(account)
 		return
 	}

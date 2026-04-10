@@ -172,6 +172,20 @@ func TestFastSchedulerSkipsStaleBucketEntryWithoutUpdate(t *testing.T) {
 	}
 }
 
+func TestFastSchedulerKeepsRateLimitedAccountOutAfterCooldownExpiry(t *testing.T) {
+	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 1)
+	acc.Status = StatusCooldown
+	acc.CooldownReason = "rate_limited"
+	acc.CooldownUtil = time.Now().Add(-1 * time.Minute)
+
+	scheduler := NewFastScheduler(1, "", 0)
+	scheduler.Rebuild([]*Account{acc})
+
+	if got := scheduler.Acquire(); got != nil {
+		t.Fatalf("Acquire() = %+v, want nil for expired-but-unprobed rate_limited account", got)
+	}
+}
+
 func TestBuildFastSchedulerFromStore(t *testing.T) {
 	store := &Store{
 		accounts: []*Account{
