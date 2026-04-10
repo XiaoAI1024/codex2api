@@ -529,7 +529,19 @@ export default function Accounts() {
         showToast(t('accounts.copyAccessTokenNoToken'), 'error')
         return
       }
-      await navigator.clipboard.writeText(tokens.join('\n'))
+      const text = tokens.join('\n')
+      if (navigator.clipboard) {
+        await navigator.clipboard.writeText(text)
+      } else {
+        const ta = document.createElement('textarea')
+        ta.value = text
+        ta.style.position = 'fixed'
+        ta.style.opacity = '0'
+        document.body.appendChild(ta)
+        ta.select()
+        document.execCommand('copy')
+        document.body.removeChild(ta)
+      }
       showToast(t('accounts.copyAccessTokenSuccess', { count: tokens.length }))
     } catch (error) {
       showToast(`${t('accounts.exportFailed')}: ${getErrorMessage(error)}`, 'error')
