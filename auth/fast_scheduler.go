@@ -178,12 +178,18 @@ func (s *FastScheduler) SetBaseLimit(baseLimit int64) {
 }
 
 func (s *FastScheduler) Acquire() *Account {
-	return s.AcquireExcluding(nil)
+	return s.AcquireMatching(nil, nil)
 }
 
 // AcquireExcluding 获取下一个可用账号，排除指定的账号 ID 集合
 // 两阶段调度：优先在验证过的账号中选取，全忙时回退到全量扫描
 func (s *FastScheduler) AcquireExcluding(exclude map[int64]bool) *Account {
+	return s.AcquireMatching(exclude, nil)
+}
+
+// AcquireMatching 获取下一个满足过滤条件的可用账号。
+// matcher 为 nil 时表示不过滤。
+func (s *FastScheduler) AcquireMatching(exclude map[int64]bool, matcher AccountMatcher) *Account {
 	if s == nil {
 		return nil
 	}
@@ -198,7 +204,7 @@ func (s *FastScheduler) AcquireExcluding(exclude map[int64]bool) *Account {
 			if len(bucket) == 0 {
 				continue
 			}
-			if acc := s.scanPreferred(bucket, &s.preferredCursors[tierIdx], baseLimit, now, exclude); acc != nil {
+			if acc := s.scanPreferred(bucket, &s.preferredCursors[tierIdx], baseLimit, now, exclude, matcher); acc != nil {
 				s.mu.RUnlock()
 				return acc
 			}
@@ -213,14 +219,14 @@ func (s *FastScheduler) AcquireExcluding(exclude map[int64]bool) *Account {
 		// 阶段 1：优先在验证过的账号（桶前部 provenBound 个）中 round-robin
 		provenBound := s.provenBounds[tierIdx]
 		if provenBound > 0 {
-			if acc := s.scanRange(bucket, 0, provenBound, &s.provenCurs[tierIdx], baseLimit, now, exclude); acc != nil {
+			if acc := s.scanRange(bucket, 0, provenBound, &s.provenCurs[tierIdx], baseLimit, now, exclude, matcher); acc != nil {
 				s.mu.RUnlock()
 				return acc
 			}
 		}
 
 		// 阶段 2：回退到全量 round-robin
-		if acc := s.scanRange(bucket, 0, len(bucket), &s.cursors[tierIdx], baseLimit, now, exclude); acc != nil {
+		if acc := s.scanRange(bucket, 0, len(bucket), &s.cursors[tierIdx], baseLimit, now, exclude, matcher); acc != nil {
 			s.mu.RUnlock()
 			return acc
 		}
@@ -230,7 +236,7 @@ func (s *FastScheduler) AcquireExcluding(exclude map[int64]bool) *Account {
 }
 
 // scanRange 在 bucket[start:end) 范围内 round-robin 扫描可用账号
-func (s *FastScheduler) scanRange(bucket []fastSchedulerEntry, rangeStart, rangeEnd int, cursor *atomic.Uint64, baseLimit int64, now time.Time, exclude map[int64]bool) *Account {
+func (s *FastScheduler) scanRange(bucket []fastSchedulerEntry, rangeStart, rangeEnd int, cursor *atomic.Uint64, baseLimit int64, now time.Time, exclude map[int64]bool, matcher AccountMatcher) *Account {
 	rangeLen := rangeEnd - rangeStart
 	if rangeLen <= 0 {
 		return nil
@@ -242,6 +248,9 @@ func (s *FastScheduler) scanRange(bucket []fastSchedulerEntry, rangeStart, range
 			continue
 		}
 		if exclude != nil && exclude[entry.dbID] {
+			continue
+		}
+		if matcher != nil && !matcher(entry.acc) {
 			continue
 		}
 		_, _, limit, available := entry.acc.fastSchedulerSnapshot(baseLimit, now)
@@ -256,7 +265,7 @@ func (s *FastScheduler) scanRange(bucket []fastSchedulerEntry, rangeStart, range
 	return nil
 }
 
-func (s *FastScheduler) scanPreferred(bucket []fastSchedulerEntry, cursor *atomic.Uint64, baseLimit int64, now time.Time, exclude map[int64]bool) *Account {
+func (s *FastScheduler) scanPreferred(bucket []fastSchedulerEntry, cursor *atomic.Uint64, baseLimit int64, now time.Time, exclude map[int64]bool, matcher AccountMatcher) *Account {
 	bucketLen := len(bucket)
 	if bucketLen == 0 {
 		return nil
@@ -268,6 +277,9 @@ func (s *FastScheduler) scanPreferred(bucket []fastSchedulerEntry, cursor *atomi
 			continue
 		}
 		if exclude != nil && exclude[entry.dbID] {
+			continue
+		}
+		if matcher != nil && !matcher(entry.acc) {
 			continue
 		}
 		_, _, limit, available := entry.acc.fastSchedulerSnapshot(baseLimit, now)
@@ -440,8 +452,12 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 	}
 
 	available := a.Status != StatusError && tier != HealthTierBanned && a.AccessToken != ""
-	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
-		available = false
+	if a.Status == StatusCooldown {
+		if a.CooldownReason == "rate_limited" {
+			available = false
+		} else if now.Before(a.CooldownUtil) {
+			available = false
+		}
 	}
 
 	return tier, score, limit, available

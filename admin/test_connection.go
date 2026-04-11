@@ -253,6 +253,12 @@ func (h *Handler) BatchRefresh(c *gin.Context) {
 				atomic.AddInt64(&failedCount, 1)
 				return
 			}
+			syncCtx, syncCancel := context.WithTimeout(context.Background(), 25*time.Second)
+			defer syncCancel()
+			if err := h.forceSyncPlanFromWhamUsageByID(syncCtx, id); err != nil {
+				atomic.AddInt64(&failedCount, 1)
+				return
+			}
 			atomic.AddInt64(&successCount, 1)
 		}(dbID)
 	}

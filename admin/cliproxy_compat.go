@@ -645,9 +645,6 @@ func (h *Handler) insertCompatAccount(ctx context.Context, name string, entry co
 	if entry.accountID != "" {
 		creds["account_id"] = entry.accountID
 	}
-	if entry.planType != "" {
-		creds["plan_type"] = entry.planType
-	}
 	if !entry.expiresAt.IsZero() {
 		creds["expires_at"] = entry.expiresAt.Format(time.RFC3339)
 	} else if entry.expiresRaw != "" {
@@ -663,7 +660,6 @@ func (h *Handler) insertCompatAccount(ctx context.Context, name string, entry co
 		AccessToken:  entry.accessToken,
 		AccountID:    entry.accountID,
 		Email:        entry.email,
-		PlanType:     entry.planType,
 		ProxyURL:     entry.proxyURL,
 	}
 	if sourcePublicKeyID != nil && *sourcePublicKeyID > 0 {
@@ -712,6 +708,7 @@ func (h *Handler) insertCompatAccount(ctx context.Context, name string, entry co
 			bound.PublicAPIKeyID = *sourcePublicKeyID
 			bound.Mu().Unlock()
 		}
+		h.triggerForcedPlanSync(id, "cliproxy_public_upload")
 		h.db.InsertAccountEventAsync(id, "upload_valid", "cliproxy")
 	} else if entry.refreshToken != "" && entry.accessToken == "" {
 		go func(accountID int64) {
@@ -719,8 +716,16 @@ func (h *Handler) insertCompatAccount(ctx context.Context, name string, entry co
 			defer cancel()
 			if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
 				log.Printf("[cliproxy] 账号 %d 刷新失败: %v", accountID, err)
+				return
+			}
+			syncCtx, syncCancel := context.WithTimeout(context.Background(), 25*time.Second)
+			defer syncCancel()
+			if err := h.forceSyncPlanFromWhamUsageByID(syncCtx, accountID); err != nil {
+				log.Printf("[cliproxy] 账号 %d 套餐同步失败: %v", accountID, err)
 			}
 		}(id)
+	} else if entry.accessToken != "" {
+		h.triggerForcedPlanSync(id, "cliproxy_upload")
 	}
 
 	return id, nil

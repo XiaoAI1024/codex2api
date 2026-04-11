@@ -291,14 +291,14 @@ type schedulerBreakdownResponse struct {
 
 // ListAccounts 获取账号列表
 func (h *Handler) ListAccounts(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer cancel()
 	now := time.Now()
 
 	h.store.TriggerUsageProbeAsync()
 	h.store.TriggerRecoveryProbeAsync()
 
-	rows, err := h.db.ListActive(ctx)
+	rows, err := h.db.ListActiveForAdmin(ctx)
 	if err != nil {
 		writeInternalError(c, err)
 		return
@@ -315,6 +315,8 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 
 	accounts := make([]accountResponse, 0, len(rows))
 	for _, row := range rows {
+		hasRT := row.GetCredential("refresh_token_present") != "" || row.GetCredential("refresh_token") != ""
+		hasAT := row.GetCredential("access_token_present") != "" || row.GetCredential("access_token") != ""
 		resp := accountResponse{
 			ID:                  row.ID,
 			Name:                row.Name,
@@ -322,7 +324,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			PlanType:            auth.NormalizePlanType(row.GetCredential("plan_type")),
 			SettlementAmountUSD: row.SettledAmount,
 			Status:              row.Status,
-			ATOnly:              row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			ATOnly:              !hasRT && hasAT,
 			ProxyURL:            row.ProxyURL,
 			CreatedAt:           row.CreatedAt.Format(time.RFC3339),
 			UpdatedAt:           row.UpdatedAt.Format(time.RFC3339),
@@ -571,6 +573,11 @@ func (h *Handler) AddAccount(c *gin.Context) {
 				log.Printf("新账号 %d 刷新失败: %v", accountID, err)
 			} else {
 				log.Printf("新账号 %d 刷新成功，已加入号池", accountID)
+				syncCtx, syncCancel := context.WithTimeout(context.Background(), 25*time.Second)
+				defer syncCancel()
+				if err := h.forceSyncPlanFromWhamUsageByID(syncCtx, accountID); err != nil {
+					log.Printf("新账号 %d 套餐同步失败: %v", accountID, err)
+				}
 			}
 		}(id)
 	}
@@ -672,7 +679,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		successCount++
 		h.db.InsertAccountEventAsync(id, "added", "manual_at")
 
-		// 解析 AT JWT 提取账号信息（email、plan_type、account_id、过期时间）
+		// 解析 AT JWT 提取账号信息（email、account_id、过期时间）
 		atInfo := auth.ParseAccessToken(at)
 
 		// 热加载到内存池（AT-only，无 RT）
@@ -685,7 +692,6 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		if atInfo != nil {
 			newAcc.Email = atInfo.Email
 			newAcc.AccountID = atInfo.ChatGPTAccountID
-			newAcc.PlanType = atInfo.PlanType
 			if !atInfo.ExpiresAt.IsZero() {
 				newAcc.ExpiresAt = atInfo.ExpiresAt
 			}
@@ -697,13 +703,13 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			creds := map[string]interface{}{
 				"email":      atInfo.Email,
 				"account_id": atInfo.ChatGPTAccountID,
-				"plan_type":  atInfo.PlanType,
 				"expires_at": newAcc.ExpiresAt.Format(time.RFC3339),
 			}
 			if err := h.db.UpdateCredentials(ctx, id, creds); err != nil {
 				log.Printf("AT 账号 %d 更新 credentials 失败: %v", id, err)
 			}
 		}
+		h.triggerForcedPlanSync(id, "manual_at")
 		log.Printf("AT 账号 %d 已加入号池 (id=%d, email=%s)", i+1, id, newAcc.Email)
 	}
 
@@ -1011,6 +1017,11 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 					log.Printf("导入账号 %d 刷新失败: %v", accountID, err)
 				} else {
 					log.Printf("导入账号 %d 刷新成功", accountID)
+					syncCtx, syncCancel := context.WithTimeout(context.Background(), 25*time.Second)
+					defer syncCancel()
+					if err := h.forceSyncPlanFromWhamUsageByID(syncCtx, accountID); err != nil {
+						log.Printf("导入账号 %d 套餐同步失败: %v", accountID, err)
+					}
 				}
 			}(id)
 		}(i, t)
@@ -1188,9 +1199,6 @@ func (h *Handler) importMixedAccountsCommon(c *gin.Context, items []importAccoun
 			if it.entry.accountID != "" {
 				creds["account_id"] = it.entry.accountID
 			}
-			if it.entry.planType != "" {
-				creds["plan_type"] = it.entry.planType
-			}
 			if !it.entry.expiresAt.IsZero() {
 				creds["expires_at"] = it.entry.expiresAt.Format(time.RFC3339)
 			} else if it.entry.expiresRaw != "" {
@@ -1209,7 +1217,6 @@ func (h *Handler) importMixedAccountsCommon(c *gin.Context, items []importAccoun
 				AccessToken:  at,
 				AccountID:    it.entry.accountID,
 				Email:        it.entry.email,
-				PlanType:     it.entry.planType,
 				ProxyURL:     it.entry.proxyURL,
 			}
 			if !it.entry.expiresAt.IsZero() {
@@ -1231,8 +1238,15 @@ func (h *Handler) importMixedAccountsCommon(c *gin.Context, items []importAccoun
 						log.Printf("导入账号 %d 刷新失败: %v", accountID, err)
 					} else {
 						log.Printf("导入账号 %d 刷新成功", accountID)
+						syncCtx, syncCancel := context.WithTimeout(context.Background(), 25*time.Second)
+						defer syncCancel()
+						if err := h.forceSyncPlanFromWhamUsageByID(syncCtx, accountID); err != nil {
+							log.Printf("导入账号 %d 套餐同步失败: %v", accountID, err)
+						}
 					}
 				}(id)
+			} else if at != "" {
+				h.triggerForcedPlanSync(id, "import")
 			}
 		}(i, item)
 	}
@@ -1385,7 +1399,6 @@ func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string) {
 			if atInfo != nil {
 				newAcc.Email = atInfo.Email
 				newAcc.AccountID = atInfo.ChatGPTAccountID
-				newAcc.PlanType = atInfo.PlanType
 				if !atInfo.ExpiresAt.IsZero() {
 					newAcc.ExpiresAt = atInfo.ExpiresAt
 				}
@@ -1394,7 +1407,6 @@ func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string) {
 				_ = h.db.UpdateCredentials(credCtx, id, map[string]interface{}{
 					"email":      atInfo.Email,
 					"account_id": atInfo.ChatGPTAccountID,
-					"plan_type":  atInfo.PlanType,
 					"expires_at": newAcc.ExpiresAt.Format(time.RFC3339),
 				})
 				credCancel()
@@ -1405,6 +1417,7 @@ func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string) {
 				}
 			}
 			h.store.AddAccount(newAcc)
+			h.triggerForcedPlanSync(id, "import_at")
 		}(i, at)
 	}
 
@@ -1488,6 +1501,11 @@ func (h *Handler) RefreshAccount(c *gin.Context) {
 		}
 		writeError(c, http.StatusInternalServerError, "刷新失败: "+err.Error())
 		return
+	}
+	syncCtx, syncCancel := context.WithTimeout(c.Request.Context(), 25*time.Second)
+	defer syncCancel()
+	if err := h.forceSyncPlanFromWhamUsageByID(syncCtx, id); err != nil {
+		log.Printf("账号 %d 刷新后套餐同步失败: %v", id, err)
 	}
 
 	writeMessage(c, http.StatusOK, "账号刷新成功")
@@ -1906,6 +1924,9 @@ type settingsResponse struct {
 	PlusPortAccessFree     bool    `json:"plus_port_access_free"`
 	SchedulerPreferredPlan string  `json:"scheduler_preferred_plan"`
 	SchedulerPlanBonus     int     `json:"scheduler_plan_bonus"`
+	QuotaRatePlus          float64 `json:"quota_rate_plus"`
+	QuotaRatePro           float64 `json:"quota_rate_pro"`
+	QuotaRateTeam          float64 `json:"quota_rate_team"`
 	MaxRetries             int     `json:"max_retries"`
 	AllowRemoteMigration   bool    `json:"allow_remote_migration"`
 	PublicInitialCreditUSD float64 `json:"public_initial_credit_usd"`
@@ -1938,6 +1959,9 @@ type updateSettingsReq struct {
 	PlusPortAccessFree     *bool    `json:"plus_port_access_free"`
 	SchedulerPreferredPlan *string  `json:"scheduler_preferred_plan"`
 	SchedulerPlanBonus     *int     `json:"scheduler_plan_bonus"`
+	QuotaRatePlus          *float64 `json:"quota_rate_plus"`
+	QuotaRatePro           *float64 `json:"quota_rate_pro"`
+	QuotaRateTeam          *float64 `json:"quota_rate_team"`
 	MaxRetries             *int     `json:"max_retries"`
 	AllowRemoteMigration   *bool    `json:"allow_remote_migration"`
 	PublicInitialCreditUSD *float64 `json:"public_initial_credit_usd"`
@@ -1959,6 +1983,20 @@ func normalizeSchedulerPreferredPlan(raw string) (string, bool) {
 	}
 }
 
+func defaultQuotaRates() (plus float64, pro float64, team float64) {
+	return 10, 100, 10
+}
+
+func normalizeQuotaRate(value float64, fallback float64) (float64, bool) {
+	if value <= 0 {
+		return fallback, false
+	}
+	if value > 100000 {
+		return fallback, false
+	}
+	return value, true
+}
+
 // GetSettings 获取当前系统设置
 func (h *Handler) GetSettings(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
@@ -1968,6 +2006,18 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	adminSecret := ""
 	if dbSettings != nil && adminAuthSource != "env" {
 		adminSecret = dbSettings.AdminSecret
+	}
+	quotaRatePlus, quotaRatePro, quotaRateTeam := defaultQuotaRates()
+	if dbSettings != nil {
+		if normalized, ok := normalizeQuotaRate(dbSettings.QuotaRatePlus, quotaRatePlus); ok {
+			quotaRatePlus = normalized
+		}
+		if normalized, ok := normalizeQuotaRate(dbSettings.QuotaRatePro, quotaRatePro); ok {
+			quotaRatePro = normalized
+		}
+		if normalized, ok := normalizeQuotaRate(dbSettings.QuotaRateTeam, quotaRateTeam); ok {
+			quotaRateTeam = normalized
+		}
 	}
 	c.JSON(http.StatusOK, settingsResponse{
 		MaxConcurrency:         h.store.GetMaxConcurrency(),
@@ -1991,6 +2041,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		PlusPortAccessFree:     h.store.GetPlusPortAccessFree(),
 		SchedulerPreferredPlan: h.store.GetPreferredPlanType(),
 		SchedulerPlanBonus:     h.store.GetPreferredPlanBonus(),
+		QuotaRatePlus:          quotaRatePlus,
+		QuotaRatePro:           quotaRatePro,
+		QuotaRateTeam:          quotaRateTeam,
 		MaxRetries:             h.store.GetMaxRetries(),
 		AllowRemoteMigration:   h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		PublicInitialCreditUSD: h.store.GetPublicInitialCreditUSD(),
@@ -2011,8 +2064,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	currentAdminSecret := ""
+	quotaRatePlus, quotaRatePro, quotaRateTeam := defaultQuotaRates()
 	if dbSettings, err := h.db.GetSystemSettings(c.Request.Context()); err == nil && dbSettings != nil {
 		currentAdminSecret = dbSettings.AdminSecret
+		if normalized, ok := normalizeQuotaRate(dbSettings.QuotaRatePlus, quotaRatePlus); ok {
+			quotaRatePlus = normalized
+		}
+		if normalized, ok := normalizeQuotaRate(dbSettings.QuotaRatePro, quotaRatePro); ok {
+			quotaRatePro = normalized
+		}
+		if normalized, ok := normalizeQuotaRate(dbSettings.QuotaRateTeam, quotaRateTeam); ok {
+			quotaRateTeam = normalized
+		}
 	}
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
@@ -2183,6 +2246,31 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: scheduler_preferred_plan = %s, scheduler_plan_bonus = %d", h.store.GetPreferredPlanType(), h.store.GetPreferredPlanBonus())
 	}
 
+	if req.QuotaRatePlus != nil {
+		normalized, ok := normalizeQuotaRate(*req.QuotaRatePlus, quotaRatePlus)
+		if !ok {
+			writeError(c, http.StatusBadRequest, "quota_rate_plus 必须在 (0, 100000] 范围内")
+			return
+		}
+		quotaRatePlus = normalized
+	}
+	if req.QuotaRatePro != nil {
+		normalized, ok := normalizeQuotaRate(*req.QuotaRatePro, quotaRatePro)
+		if !ok {
+			writeError(c, http.StatusBadRequest, "quota_rate_pro 必须在 (0, 100000] 范围内")
+			return
+		}
+		quotaRatePro = normalized
+	}
+	if req.QuotaRateTeam != nil {
+		normalized, ok := normalizeQuotaRate(*req.QuotaRateTeam, quotaRateTeam)
+		if !ok {
+			writeError(c, http.StatusBadRequest, "quota_rate_team 必须在 (0, 100000] 范围内")
+			return
+		}
+		quotaRateTeam = normalized
+	}
+
 	if req.MaxRetries != nil {
 		v := *req.MaxRetries
 		if v < 0 {
@@ -2251,6 +2339,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PlusPortAccessFree:     h.store.GetPlusPortAccessFree(),
 		SchedulerPreferredPlan: h.store.GetPreferredPlanType(),
 		SchedulerPlanBonus:     h.store.GetPreferredPlanBonus(),
+		QuotaRatePlus:          quotaRatePlus,
+		QuotaRatePro:           quotaRatePro,
+		QuotaRateTeam:          quotaRateTeam,
 		MaxRetries:             h.store.GetMaxRetries(),
 		AllowRemoteMigration:   h.store.GetAllowRemoteMigration() && hasAdminSecret,
 		PublicInitialCreditUSD: h.store.GetPublicInitialCreditUSD(),
@@ -2295,6 +2386,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PlusPortAccessFree:     h.store.GetPlusPortAccessFree(),
 		SchedulerPreferredPlan: h.store.GetPreferredPlanType(),
 		SchedulerPlanBonus:     h.store.GetPreferredPlanBonus(),
+		QuotaRatePlus:          quotaRatePlus,
+		QuotaRatePro:           quotaRatePro,
+		QuotaRateTeam:          quotaRateTeam,
 		MaxRetries:             h.store.GetMaxRetries(),
 		AllowRemoteMigration:   h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		PublicInitialCreditUSD: h.store.GetPublicInitialCreditUSD(),

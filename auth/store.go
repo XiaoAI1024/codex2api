@@ -852,6 +852,10 @@ type Store struct {
 	allowRemoteMigration atomic.Bool // 是否允许远程迁移拉取账号
 }
 
+// AccountMatcher 用于在调度阶段对账号做额外过滤。
+// 返回 true 表示该账号允许参与本次调度。
+type AccountMatcher func(*Account) bool
+
 func fastSchedulerEnabledFromEnv() bool {
 	for _, key := range []string{"FAST_SCHEDULER_ENABLED", "CODEX_FAST_SCHEDULER"} {
 		if truthyEnv(os.Getenv(key)) {
@@ -1518,14 +1522,19 @@ func (s *Store) CleanByRuntimeStatus(ctx context.Context, targetStatus string) i
 
 // Next 获取下一个可用账号（健康优先 + 低负载择优 + warm 公平调度）
 func (s *Store) Next() *Account {
-	return s.NextExcluding(nil)
+	return s.NextMatching(nil, nil)
 }
 
 // NextExcluding 获取下一个可用账号，排除指定的账号 ID 集合
 // 用于重试时避免再次选到已失败（如 401）的账号
 func (s *Store) NextExcluding(exclude map[int64]bool) *Account {
+	return s.NextMatching(exclude, nil)
+}
+
+// NextMatching 获取下一个可用账号，并支持额外过滤条件。
+func (s *Store) NextMatching(exclude map[int64]bool, matcher AccountMatcher) *Account {
 	if scheduler := s.getFastScheduler(); scheduler != nil {
-		return scheduler.AcquireExcluding(exclude)
+		return scheduler.AcquireMatching(exclude, matcher)
 	}
 
 	s.mu.RLock()
@@ -1551,6 +1560,9 @@ func (s *Store) NextExcluding(exclude map[int64]bool) *Account {
 			continue
 		}
 		if !acc.IsAvailable() {
+			continue
+		}
+		if matcher != nil && !matcher(acc) {
 			continue
 		}
 
@@ -1615,6 +1627,11 @@ func (s *Store) NextExcluding(exclude map[int64]bool) *Account {
 
 // WaitForAvailable 等待可用账号（带超时的请求排队）
 func (s *Store) WaitForAvailable(ctx context.Context, timeout time.Duration) *Account {
+	return s.WaitForAvailableMatching(ctx, timeout, nil, nil)
+}
+
+// WaitForAvailableMatching 等待满足过滤条件的可用账号（带超时的请求排队）
+func (s *Store) WaitForAvailableMatching(ctx context.Context, timeout time.Duration, exclude map[int64]bool, matcher AccountMatcher) *Account {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 
@@ -1629,7 +1646,7 @@ func (s *Store) WaitForAvailable(ctx context.Context, timeout time.Duration) *Ac
 		case <-deadline.C:
 			return nil
 		default:
-			acc := s.Next()
+			acc := s.NextMatching(exclude, matcher)
 			if acc != nil {
 				return acc
 			}
@@ -2704,7 +2721,6 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	if info != nil {
 		acc.AccountID = info.ChatGPTAccountID
 		acc.Email = info.Email
-		acc.PlanType = NormalizePlanType(info.PlanType)
 	}
 	if activeCooldown {
 		acc.Status = StatusCooldown
@@ -2735,7 +2751,6 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	if info != nil {
 		credentials["account_id"] = info.ChatGPTAccountID
 		credentials["email"] = info.Email
-		credentials["plan_type"] = NormalizePlanType(info.PlanType)
 	}
 	if err := s.db.UpdateCredentials(ctx, dbID, credentials); err != nil {
 		log.Printf("[账号 %d] 更新数据库失败: %v", dbID, err)

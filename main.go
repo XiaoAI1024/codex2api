@@ -75,6 +75,9 @@ func main() {
 			PlusPortAccessFree:     true,
 			PublicInitialCreditUSD: 0.1,
 			PublicFullCreditUSD:    2,
+			QuotaRatePlus:          10,
+			QuotaRatePro:           100,
+			QuotaRateTeam:          10,
 		}
 		_ = db.UpdateSystemSettings(context.Background(), settings)
 	} else if err != nil {
@@ -90,6 +93,9 @@ func main() {
 			PlusPortAccessFree:     true,
 			PublicInitialCreditUSD: 0.1,
 			PublicFullCreditUSD:    2,
+			QuotaRatePlus:          10,
+			QuotaRatePro:           100,
+			QuotaRateTeam:          10,
 		}
 	} else {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
@@ -308,6 +314,7 @@ func main() {
 func loggerMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
+		c.Set("x-request-start-time", start)
 		c.Next()
 		latency := time.Since(start)
 
@@ -316,6 +323,20 @@ func loggerMiddleware() gin.HandlerFunc {
 		modelVal, _ := c.Get("x-model")
 		effortVal, _ := c.Get("x-reasoning-effort")
 		tierVal, _ := c.Get("x-service-tier")
+		attemptsVal, _ := c.Get("x-upstream-attempts")
+		failedAttemptsVal, _ := c.Get("x-upstream-failed-attempts")
+		requestIDVal, _ := c.Get("x-request-id")
+		schedulerAcquireVal, _ := c.Get("x-scheduler-acquire-ms")
+		schedulerAttemptVal, _ := c.Get("x-scheduler-attempt-ms")
+		schedulerWaitRoundsVal, _ := c.Get("x-scheduler-wait-rounds")
+		upstreamStageVal, _ := c.Get("x-upstream-stage-ms")
+		upstreamHeaderVal, _ := c.Get("x-upstream-header-ms")
+		upstreamFrameVal, _ := c.Get("x-upstream-first-frame-ms")
+		upstreamFirstByteVal, _ := c.Get("x-upstream-first-byte-ms")
+		upstreamAttemptVal, _ := c.Get("x-upstream-attempt-total-ms")
+		upstreamConnectVal, _ := c.Get("x-upstream-connect-ms")
+		upstreamReusedVal, _ := c.Get("x-upstream-reused-conn")
+		firstTokenVal, _ := c.Get("x-first-token-ms")
 
 		emailStr := ""
 		if e, ok := email.(string); ok && e != "" {
@@ -332,11 +353,53 @@ func loggerMiddleware() gin.HandlerFunc {
 		if m, ok := modelVal.(string); ok && m != "" {
 			tags = append(tags, security.SanitizeLog(m))
 		}
+		if rid, ok := requestIDVal.(string); ok && rid != "" {
+			tags = append(tags, "rid="+security.SanitizeLog(rid))
+		}
 		if e, ok := effortVal.(string); ok && e != "" {
 			tags = append(tags, "effort="+security.SanitizeLog(e))
 		}
 		if t, ok := tierVal.(string); ok && t == "fast" {
 			tags = append(tags, "fast")
+		}
+		if attempts, ok := attemptsVal.(int); ok && attempts > 1 {
+			tags = append(tags, fmt.Sprintf("attempts=%d", attempts))
+		}
+		if failed, ok := failedAttemptsVal.(string); ok && failed != "" {
+			tags = append(tags, "failed="+security.SanitizeLog(failed))
+		}
+		if acquireMs, ok := schedulerAcquireVal.(int64); ok && acquireMs >= 20 {
+			tags = append(tags, fmt.Sprintf("sched=%dms", acquireMs))
+		}
+		if attemptPickMs, ok := schedulerAttemptVal.(int); ok && attemptPickMs >= 20 {
+			tags = append(tags, fmt.Sprintf("pick=%dms", attemptPickMs))
+		}
+		if waitRounds, ok := schedulerWaitRoundsVal.(int); ok && waitRounds > 0 {
+			tags = append(tags, fmt.Sprintf("wait=%d", waitRounds))
+		}
+		if upstreamMs, ok := upstreamStageVal.(int64); ok && upstreamMs > 0 {
+			tags = append(tags, fmt.Sprintf("forward=%dms", upstreamMs))
+		}
+		if headerMs, ok := upstreamHeaderVal.(int); ok && headerMs > 0 {
+			tags = append(tags, fmt.Sprintf("header=%dms", headerMs))
+		}
+		if frameMs, ok := upstreamFrameVal.(int); ok && frameMs > 0 {
+			tags = append(tags, fmt.Sprintf("frame=%dms", frameMs))
+		}
+		if firstByteMs, ok := upstreamFirstByteVal.(int); ok && firstByteMs > 0 {
+			tags = append(tags, fmt.Sprintf("ttfb=%dms", firstByteMs))
+		}
+		if connectMs, ok := upstreamConnectVal.(int); ok && connectMs > 0 {
+			tags = append(tags, fmt.Sprintf("connect=%dms", connectMs))
+		}
+		if attemptMs, ok := upstreamAttemptVal.(int); ok && attemptMs > 0 {
+			tags = append(tags, fmt.Sprintf("attempt=%dms", attemptMs))
+		}
+		if firstMs, ok := firstTokenVal.(int); ok && firstMs > 0 {
+			tags = append(tags, fmt.Sprintf("first=%dms", firstMs))
+		}
+		if reused, ok := upstreamReusedVal.(bool); ok && reused {
+			tags = append(tags, "reused")
 		}
 		tagStr := ""
 		if len(tags) > 0 {

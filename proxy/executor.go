@@ -3,10 +3,12 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -165,21 +167,94 @@ var WebsocketExecuteFunc func(
 	headers http.Header,
 ) (*http.Response, error)
 
+type UpstreamAttemptTrace struct {
+	StartedAt           time.Time
+	ProxyURL            string
+	Transport           string
+	WebsocketFallback   bool
+	ReusedConn          bool
+	WasIdleConn         bool
+	DNSStartAt          time.Time
+	DNSDoneAt           time.Time
+	ConnectStartAt      time.Time
+	ConnectDoneAt       time.Time
+	TLSStartAt          time.Time
+	TLSDoneAt           time.Time
+	FirstResponseByteAt time.Time
+	HeaderAt            time.Time
+	ErrorAt             time.Time
+}
+
+func newUpstreamAttemptTrace(proxyURL string) *UpstreamAttemptTrace {
+	return &UpstreamAttemptTrace{
+		StartedAt: time.Now(),
+		ProxyURL:  proxyURL,
+		Transport: "http",
+	}
+}
+
+func setFirstTimestamp(dst *time.Time, t time.Time) {
+	if dst == nil || t.IsZero() {
+		return
+	}
+	if dst.IsZero() {
+		*dst = t
+	}
+}
+
+func elapsedTraceMs(start, end time.Time) int {
+	if start.IsZero() || end.IsZero() || end.Before(start) {
+		return 0
+	}
+	return int(end.Sub(start).Milliseconds())
+}
+
+func (t *UpstreamAttemptTrace) HeaderMs() int {
+	if t == nil {
+		return 0
+	}
+	return elapsedTraceMs(t.StartedAt, t.HeaderAt)
+}
+
+func (t *UpstreamAttemptTrace) FirstResponseByteMs() int {
+	if t == nil {
+		return 0
+	}
+	return elapsedTraceMs(t.StartedAt, t.FirstResponseByteAt)
+}
+
+func (t *UpstreamAttemptTrace) ConnectMs() int {
+	if t == nil {
+		return 0
+	}
+	return elapsedTraceMs(t.ConnectStartAt, t.ConnectDoneAt)
+}
+
+func (t *UpstreamAttemptTrace) DNSMs() int {
+	if t == nil {
+		return 0
+	}
+	return elapsedTraceMs(t.DNSStartAt, t.DNSDoneAt)
+}
+
+func (t *UpstreamAttemptTrace) TLSMs() int {
+	if t == nil {
+		return 0
+	}
+	return elapsedTraceMs(t.TLSStartAt, t.TLSDoneAt)
+}
+
 // ExecuteRequest 向 Codex 上游发送请求
 // sessionID 可选，用于 prompt cache 会话绑定
 // useWebsocket 可选，如果为 true 则使用 WebSocket 连接
 // headers 下游请求头，用于设备指纹学习
 func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, useWebsocket ...bool) (*http.Response, error) {
-	// 检查是否使用 WebSocket
-	if len(useWebsocket) > 0 && useWebsocket[0] && WebsocketExecuteFunc != nil {
-		wsResp, wsErr := WebsocketExecuteFunc(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers)
-		if wsErr == nil {
-			return wsResp, nil
-		}
-		// 对齐 CLIProxyAPI 的稳态策略：WebSocket 失败自动回退 HTTP 链路，避免单点失败。
-		log.Printf("WebSocket 上游失败，回退 HTTP: account=%d err=%v", account.ID(), wsErr)
-	}
+	resp, _, err := ExecuteRequestTraced(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers, useWebsocket...)
+	return resp, err
+}
 
+func ExecuteRequestTraced(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, useWebsocket ...bool) (*http.Response, *UpstreamAttemptTrace, error) {
+	// 检查是否使用 WebSocket
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -196,7 +271,21 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	}
 
 	if accessToken == "" {
-		return nil, ErrNoAvailableAccount()
+		return nil, nil, ErrNoAvailableAccount()
+	}
+
+	trace := newUpstreamAttemptTrace(proxyURL)
+	if len(useWebsocket) > 0 && useWebsocket[0] && WebsocketExecuteFunc != nil {
+		trace.Transport = "websocket"
+		wsResp, wsErr := WebsocketExecuteFunc(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers)
+		if wsErr == nil {
+			trace.HeaderAt = time.Now()
+			return wsResp, trace, nil
+		}
+		// 对齐 CLIProxyAPI 的稳态策略：WebSocket 失败自动回退 HTTP 链路，避免单点失败。
+		log.Printf("WebSocket 上游失败，回退 HTTP: account=%d err=%v", account.ID(), wsErr)
+		trace = newUpstreamAttemptTrace(proxyURL)
+		trace.WebsocketFallback = true
 	}
 
 	// ==================== Codex 请求体优化 ====================
@@ -225,8 +314,36 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
 	if err != nil {
-		return nil, ErrInternalError("创建请求失败", err)
+		trace.ErrorAt = time.Now()
+		return nil, trace, ErrInternalError("创建请求失败", err)
 	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		DNSStart: func(httptrace.DNSStartInfo) {
+			setFirstTimestamp(&trace.DNSStartAt, time.Now())
+		},
+		DNSDone: func(httptrace.DNSDoneInfo) {
+			setFirstTimestamp(&trace.DNSDoneAt, time.Now())
+		},
+		ConnectStart: func(_, _ string) {
+			setFirstTimestamp(&trace.ConnectStartAt, time.Now())
+		},
+		ConnectDone: func(_, _ string, _ error) {
+			setFirstTimestamp(&trace.ConnectDoneAt, time.Now())
+		},
+		TLSHandshakeStart: func() {
+			setFirstTimestamp(&trace.TLSStartAt, time.Now())
+		},
+		TLSHandshakeDone: func(_ tls.ConnectionState, _ error) {
+			setFirstTimestamp(&trace.TLSDoneAt, time.Now())
+		},
+		GotConn: func(info httptrace.GotConnInfo) {
+			trace.ReusedConn = info.Reused
+			trace.WasIdleConn = info.WasIdle
+		},
+		GotFirstResponseByte: func() {
+			setFirstTimestamp(&trace.FirstResponseByteAt, time.Now())
+		},
+	}))
 
 	// ==================== 请求头（对齐 CLIProxyAPI 的稳定策略） ====================
 	identity := resolveCodexRequestIdentity(account, apiKey, headers, deviceCfg)
@@ -237,13 +354,15 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 
 	resp, err := client.Do(req)
 	if err != nil {
+		trace.ErrorAt = time.Now()
 		if shouldRecyclePooledClient(err) {
 			recyclePooledClient(account, proxyURL)
 		}
-		return nil, ErrUpstream(0, "请求上游失败", err)
+		return nil, trace, ErrUpstream(0, "请求上游失败", err)
 	}
+	trace.HeaderAt = time.Now()
 
-	return resp, nil
+	return resp, trace, nil
 }
 
 // ResolveSessionID 从下游请求提取或生成 session ID

@@ -31,6 +31,9 @@ func (h *Handler) shouldAutoSyncPlan(account *auth.Account, now time.Time) bool 
 	id := account.ID()
 	h.planSyncMu.Lock()
 	defer h.planSyncMu.Unlock()
+	if h.planSyncAt == nil {
+		h.planSyncAt = make(map[int64]time.Time)
+	}
 	last := h.planSyncAt[id]
 	if !last.IsZero() && now.Sub(last) < interval {
 		return false
@@ -40,14 +43,30 @@ func (h *Handler) shouldAutoSyncPlan(account *auth.Account, now time.Time) bool 
 	return true
 }
 
-// tryAutoSyncPlanFromWhamUsage 自动用 wham/usage 纠正套餐识别（优先修正 free/空套餐）。
-func (h *Handler) tryAutoSyncPlanFromWhamUsage(ctx context.Context, account *auth.Account) {
-	if h == nil || h.db == nil || account == nil {
+func (h *Handler) markPlanSyncAt(accountID int64, at time.Time) {
+	if h == nil || accountID <= 0 {
 		return
 	}
+	h.planSyncMu.Lock()
+	if h.planSyncAt == nil {
+		h.planSyncAt = make(map[int64]time.Time)
+	}
+	h.planSyncAt[accountID] = at
+	h.planSyncMu.Unlock()
+}
+
+// syncPlanFromWhamUsage 通过 wham/usage 同步套餐。
+// force=true 时忽略间隔限制，且按 wham/usage 结果强制覆盖当前套餐。
+func (h *Handler) syncPlanFromWhamUsage(ctx context.Context, account *auth.Account, force bool) (string, error) {
+	if h == nil || h.db == nil || account == nil {
+		return "", fmt.Errorf("handler 未初始化")
+	}
 	now := time.Now()
-	if !h.shouldAutoSyncPlan(account, now) {
-		return
+	if !force && !h.shouldAutoSyncPlan(account, now) {
+		return "", nil
+	}
+	if force {
+		h.markPlanSyncAt(account.ID(), now)
 	}
 
 	account.Mu().RLock()
@@ -57,7 +76,7 @@ func (h *Handler) tryAutoSyncPlanFromWhamUsage(ctx context.Context, account *aut
 	currentPlan := auth.NormalizePlanType(account.PlanType)
 	account.Mu().RUnlock()
 	if accessToken == "" {
-		return
+		return "", fmt.Errorf("账号缺少 access_token")
 	}
 
 	proxyURL := accountProxy
@@ -71,12 +90,7 @@ func (h *Handler) tryAutoSyncPlanFromWhamUsage(ctx context.Context, account *aut
 	bestPlan, bestSource, _, _ := pickBestPlanSnapshot(snapshots)
 	bestPlan = auth.NormalizePlanType(bestPlan)
 	if bestPlan == "" {
-		return
-	}
-
-	// 为了稳健，自动同步只做“升级修正”，避免偶发异常把高套餐降级。
-	if currentPlan != "" && !isPlanBetter(currentPlan, bestPlan) {
-		return
+		return "", fmt.Errorf("wham/usage 未识别到套餐")
 	}
 
 	account.Mu().Lock()
@@ -85,12 +99,53 @@ func (h *Handler) tryAutoSyncPlanFromWhamUsage(ctx context.Context, account *aut
 
 	dbCtx, dbCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer dbCancel()
-	_ = h.db.UpdateCredentials(dbCtx, account.ID(), map[string]interface{}{
+	if err := h.db.UpdateCredentials(dbCtx, account.ID(), map[string]interface{}{
 		"plan_type":             bestPlan,
 		"raw_info_refreshed_at": time.Now().UTC().Format(time.RFC3339),
-	})
+	}); err != nil {
+		return "", fmt.Errorf("写入套餐失败: %w", err)
+	}
 	h.db.InsertAccountEventAsync(account.ID(), "plan_refreshed", "auto_wham_usage")
 	log.Printf("[账号 %d] 自动套餐识别更新: %s -> %s (%s)", account.ID(), currentPlan, bestPlan, bestSource)
+	h.markPlanSyncAt(account.ID(), now)
+	return bestPlan, nil
+}
+
+// tryAutoSyncPlanFromWhamUsage 自动用 wham/usage 纠正套餐识别。
+func (h *Handler) tryAutoSyncPlanFromWhamUsage(ctx context.Context, account *auth.Account) {
+	if _, err := h.syncPlanFromWhamUsage(ctx, account, false); err != nil {
+		accountID := int64(0)
+		if account != nil {
+			accountID = account.ID()
+		}
+		log.Printf("[账号 %d] 自动套餐同步失败: %v", accountID, err)
+	}
+}
+
+// forceSyncPlanFromWhamUsageByID 强制从 wham/usage 同步套餐（忽略间隔限制）。
+func (h *Handler) forceSyncPlanFromWhamUsageByID(ctx context.Context, accountID int64) error {
+	if h == nil || h.store == nil {
+		return fmt.Errorf("handler/store 未初始化")
+	}
+	account := h.store.FindByID(accountID)
+	if account == nil {
+		return fmt.Errorf("账号不在运行时池中")
+	}
+	_, err := h.syncPlanFromWhamUsage(ctx, account, true)
+	return err
+}
+
+func (h *Handler) triggerForcedPlanSync(accountID int64, source string) {
+	if h == nil || accountID <= 0 {
+		return
+	}
+	go func() {
+		syncCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		if err := h.forceSyncPlanFromWhamUsageByID(syncCtx, accountID); err != nil {
+			log.Printf("[账号 %d] %s 套餐同步失败: %v", accountID, source, err)
+		}
+	}()
 }
 
 // ProbeUsageSnapshot 主动发送最小探针请求刷新账号用量

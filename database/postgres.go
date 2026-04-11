@@ -202,6 +202,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS public_api_key_id BIGINT NULL;
 
 	CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
+	CREATE INDEX IF NOT EXISTS idx_accounts_status_id ON accounts(status, id);
 	CREATE INDEX IF NOT EXISTS idx_accounts_platform ON accounts(platform);
 	CREATE INDEX IF NOT EXISTS idx_accounts_cooldown_until ON accounts(cooldown_until);
 	CREATE INDEX IF NOT EXISTS idx_accounts_public_api_key_id ON accounts(public_api_key_id);
@@ -313,7 +314,10 @@ func (db *DB) migrate(ctx context.Context) error {
 		plus_port_enabled BOOLEAN DEFAULT FALSE,
 		plus_port_access_free BOOLEAN DEFAULT TRUE,
 		scheduler_preferred_plan VARCHAR(30) DEFAULT '',
-		scheduler_plan_bonus INT DEFAULT 0
+		scheduler_plan_bonus INT DEFAULT 0,
+		quota_rate_plus NUMERIC(12,4) DEFAULT 10,
+		quota_rate_pro NUMERIC(12,4) DEFAULT 100,
+		quota_rate_team NUMERIC(12,4) DEFAULT 10
 	);
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS pg_max_conns INT DEFAULT 50;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS redis_pool_size INT DEFAULT 30;
@@ -334,6 +338,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS plus_port_access_free BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS scheduler_preferred_plan VARCHAR(30) DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS scheduler_plan_bonus INT DEFAULT 0;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS quota_rate_plus NUMERIC(12,4) DEFAULT 10;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS quota_rate_pro NUMERIC(12,4) DEFAULT 100;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS quota_rate_team NUMERIC(12,4) DEFAULT 10;
 	UPDATE system_settings
 	SET auto_clean_full_usage_mode = CASE
 		WHEN COALESCE(auto_clean_full_usage, false) THEN 'delete'
@@ -482,6 +489,9 @@ type SystemSettings struct {
 	AllowRemoteMigration   bool
 	PublicInitialCreditUSD float64
 	PublicFullCreditUSD    float64
+	QuotaRatePlus          float64
+	QuotaRatePro           float64
+	QuotaRateTeam          float64
 }
 
 func normalizeFullUsageMode(mode string) string {
@@ -513,7 +523,10 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(auto_clean_error, false),
 		       COALESCE(auto_clean_expired, false),
 		       COALESCE(public_initial_credit_usd, 0.1),
-		       COALESCE(public_full_credit_usd, 2)
+		       COALESCE(public_full_credit_usd, 2),
+		       COALESCE(quota_rate_plus, 10),
+		       COALESCE(quota_rate_pro, 100),
+		       COALESCE(quota_rate_team, 10)
 		FROM system_settings WHERE id = 1
 	`).Scan(
 		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
@@ -522,6 +535,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.SchedulerPreferredPlan, &s.SchedulerPlanBonus,
 		&s.MaxRetries, &s.AllowRemoteMigration,
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.PublicInitialCreditUSD, &s.PublicFullCreditUSD,
+		&s.QuotaRatePlus, &s.QuotaRatePro, &s.QuotaRateTeam,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -546,10 +560,12 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		INSERT INTO system_settings (
 			id, max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 			auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, auto_clean_full_usage_mode, proxy_pool_enabled,
-			fast_scheduler_enabled, plus_port_enabled, plus_port_access_free, scheduler_preferred_plan, scheduler_plan_bonus, max_retries, allow_remote_migration, auto_clean_error, auto_clean_expired,
+			fast_scheduler_enabled, plus_port_enabled, plus_port_access_free, scheduler_preferred_plan, scheduler_plan_bonus,
+			quota_rate_plus, quota_rate_pro, quota_rate_team,
+			max_retries, allow_remote_migration, auto_clean_error, auto_clean_expired,
 			public_initial_credit_usd, public_full_credit_usd
 		)
-		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
 		ON CONFLICT (id) DO UPDATE SET
 			max_concurrency         = EXCLUDED.max_concurrency,
 			global_rpm              = EXCLUDED.global_rpm,
@@ -569,6 +585,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 			plus_port_access_free   = EXCLUDED.plus_port_access_free,
 			scheduler_preferred_plan = EXCLUDED.scheduler_preferred_plan,
 			scheduler_plan_bonus    = EXCLUDED.scheduler_plan_bonus,
+			quota_rate_plus         = EXCLUDED.quota_rate_plus,
+			quota_rate_pro          = EXCLUDED.quota_rate_pro,
+			quota_rate_team         = EXCLUDED.quota_rate_team,
 			max_retries             = EXCLUDED.max_retries,
 			allow_remote_migration  = EXCLUDED.allow_remote_migration,
 			auto_clean_error        = EXCLUDED.auto_clean_error,
@@ -577,8 +596,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 			public_full_credit_usd = EXCLUDED.public_full_credit_usd
 	`, s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, fullUsageEnabled, fullUsageMode, s.ProxyPoolEnabled,
-		s.FastSchedulerEnabled, s.PlusPortEnabled, s.PlusPortAccessFree, s.SchedulerPreferredPlan, s.SchedulerPlanBonus, s.MaxRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired,
-		s.PublicInitialCreditUSD, s.PublicFullCreditUSD)
+		s.FastSchedulerEnabled, s.PlusPortEnabled, s.PlusPortAccessFree, s.SchedulerPreferredPlan, s.SchedulerPlanBonus,
+		s.QuotaRatePlus, s.QuotaRatePro, s.QuotaRateTeam,
+		s.MaxRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.PublicInitialCreditUSD, s.PublicFullCreditUSD)
 	return err
 }
 
@@ -1639,6 +1659,135 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 		accounts = append(accounts, a)
 	}
 	return accounts, rows.Err()
+}
+
+// ListActiveForAdmin 分段获取账号列表（管理页专用）。
+// 根因优化：避免一次性扫描完整 credentials（含大 token 字段）导致超时。
+func (db *DB) ListActiveForAdmin(ctx context.Context) ([]*AccountRow, error) {
+	const chunkSize = 500
+
+	pgQuery := `
+		SELECT a.id, a.name, a.platform, a.type,
+		       jsonb_build_object(
+		         'email', COALESCE(a.credentials->>'email', ''),
+		         'plan_type', COALESCE(a.credentials->>'plan_type', ''),
+		         'codex_7d_used_percent', COALESCE(a.credentials->>'codex_7d_used_percent', ''),
+		         'codex_5h_used_percent', COALESCE(a.credentials->>'codex_5h_used_percent', ''),
+		         'codex_5h_reset_at', COALESCE(a.credentials->>'codex_5h_reset_at', ''),
+		         'codex_7d_reset_at', COALESCE(a.credentials->>'codex_7d_reset_at', ''),
+		         'refresh_token_present', CASE WHEN COALESCE(a.credentials->>'refresh_token', '') <> '' THEN '1' ELSE '' END,
+		         'access_token_present', CASE WHEN COALESCE(a.credentials->>'access_token', '') <> '' THEN '1' ELSE '' END
+		       ) AS credentials,
+		       a.proxy_url,
+		       a.public_api_key_id,
+		       COALESCE(s.settled_amount_usd, 0) AS settled_amount_usd,
+		       a.status, a.cooldown_reason, a.cooldown_until,
+		       COALESCE(a.error_message, '') AS error_message,
+		       a.created_at, a.updated_at
+		FROM accounts a
+		LEFT JOIN public_account_settlements s ON s.account_id = a.id
+		WHERE a.status = 'active' AND a.id > $1
+		ORDER BY a.id
+		LIMIT $2
+	`
+
+	sqliteQuery := `
+		SELECT a.id, a.name, a.platform, a.type,
+		       json_object(
+		         'email', COALESCE(json_extract(a.credentials, '$.email'), ''),
+		         'plan_type', COALESCE(json_extract(a.credentials, '$.plan_type'), ''),
+		         'codex_7d_used_percent', COALESCE(json_extract(a.credentials, '$.codex_7d_used_percent'), ''),
+		         'codex_5h_used_percent', COALESCE(json_extract(a.credentials, '$.codex_5h_used_percent'), ''),
+		         'codex_5h_reset_at', COALESCE(json_extract(a.credentials, '$.codex_5h_reset_at'), ''),
+		         'codex_7d_reset_at', COALESCE(json_extract(a.credentials, '$.codex_7d_reset_at'), ''),
+		         'refresh_token_present', CASE WHEN COALESCE(json_extract(a.credentials, '$.refresh_token'), '') <> '' THEN '1' ELSE '' END,
+		         'access_token_present', CASE WHEN COALESCE(json_extract(a.credentials, '$.access_token'), '') <> '' THEN '1' ELSE '' END
+		       ) AS credentials,
+		       a.proxy_url,
+		       a.public_api_key_id,
+		       COALESCE(s.settled_amount_usd, 0) AS settled_amount_usd,
+		       a.status, a.cooldown_reason, a.cooldown_until,
+		       COALESCE(a.error_message, '') AS error_message,
+		       a.created_at, a.updated_at
+		FROM accounts a
+		LEFT JOIN public_account_settlements s ON s.account_id = a.id
+		WHERE a.status = 'active' AND a.id > ?
+		ORDER BY a.id
+		LIMIT ?
+	`
+
+	var accounts []*AccountRow
+	lastID := int64(0)
+
+	for {
+		query := pgQuery
+		if db.isSQLite() {
+			query = sqliteQuery
+		}
+		rows, err := db.conn.QueryContext(ctx, query, lastID, chunkSize)
+		if err != nil {
+			return nil, fmt.Errorf("查询账号失败: %w", err)
+		}
+
+		batchCount := 0
+		for rows.Next() {
+			a := &AccountRow{}
+			var credRaw interface{}
+			var cooldownUntilRaw interface{}
+			var createdAtRaw interface{}
+			var updatedAtRaw interface{}
+			if err := rows.Scan(
+				&a.ID,
+				&a.Name,
+				&a.Platform,
+				&a.Type,
+				&credRaw,
+				&a.ProxyURL,
+				&a.PublicAPIKeyID,
+				&a.SettledAmount,
+				&a.Status,
+				&a.CooldownReason,
+				&cooldownUntilRaw,
+				&a.ErrorMessage,
+				&createdAtRaw,
+				&updatedAtRaw,
+			); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("扫描账号行失败: %w", err)
+			}
+			a.Credentials = decodeCredentials(credRaw)
+			a.CooldownUntil, err = parseDBNullTimeValue(cooldownUntilRaw)
+			if err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("解析 cooldown_until 失败: %w", err)
+			}
+			a.CreatedAt, err = parseDBTimeValue(createdAtRaw)
+			if err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("解析 created_at 失败: %w", err)
+			}
+			a.UpdatedAt, err = parseDBTimeValue(updatedAtRaw)
+			if err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("解析 updated_at 失败: %w", err)
+			}
+
+			lastID = a.ID
+			batchCount++
+			accounts = append(accounts, a)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("扫描账号行失败: %w", err)
+		}
+		rows.Close()
+
+		if batchCount < chunkSize {
+			break
+		}
+	}
+
+	return accounts, nil
 }
 
 // ListAll 获取全部账号（包含 error 状态）

@@ -78,6 +78,28 @@ func TestFastSchedulerRespectsConcurrencyLimit(t *testing.T) {
 	scheduler.Release(third)
 }
 
+func TestFastSchedulerAcquireMatchingFiltersPlans(t *testing.T) {
+	plus := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 2)
+	plus.PlanType = "plus"
+	free := newFastSchedulerTestAccount(2, HealthTierHealthy, 100, 2)
+	free.PlanType = "free"
+
+	scheduler := NewFastScheduler(2, "", 0)
+	scheduler.Rebuild([]*Account{plus, free})
+
+	got := scheduler.AcquireMatching(nil, func(acc *Account) bool {
+		return acc.GetPlanType() == "free"
+	})
+	if got == nil {
+		t.Fatal("AcquireMatching() returned nil")
+	}
+	defer scheduler.Release(got)
+
+	if got.DBID != free.DBID {
+		t.Fatalf("AcquireMatching() picked dbID=%d, want free dbID=%d", got.DBID, free.DBID)
+	}
+}
+
 func TestFastSchedulerRoundRobinWithinTier(t *testing.T) {
 	a1 := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 4)
 	a2 := newFastSchedulerTestAccount(2, HealthTierHealthy, 100, 4)
@@ -147,6 +169,20 @@ func TestFastSchedulerSkipsStaleBucketEntryWithoutUpdate(t *testing.T) {
 	got := scheduler.Acquire()
 	if got != nil {
 		t.Fatalf("Acquire() = %+v, want nil for stale cooldown account", got)
+	}
+}
+
+func TestFastSchedulerKeepsRateLimitedAccountOutAfterCooldownExpiry(t *testing.T) {
+	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 1)
+	acc.Status = StatusCooldown
+	acc.CooldownReason = "rate_limited"
+	acc.CooldownUtil = time.Now().Add(-1 * time.Minute)
+
+	scheduler := NewFastScheduler(1, "", 0)
+	scheduler.Rebuild([]*Account{acc})
+
+	if got := scheduler.Acquire(); got != nil {
+		t.Fatalf("Acquire() = %+v, want nil for expired-but-unprobed rate_limited account", got)
 	}
 }
 
@@ -412,5 +448,32 @@ func TestFastSchedulerRelease(t *testing.T) {
 
 	if got := atomic.LoadInt64(&acc.ActiveRequests); got != 0 {
 		t.Fatalf("ActiveRequests after Release() = %d, want 0", got)
+	}
+}
+
+func TestStoreWaitForAvailableMatching(t *testing.T) {
+	plus := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 1)
+	plus.PlanType = "plus"
+	atomic.StoreInt64(&plus.ActiveRequests, 1) // 占满，模拟当前端口不可用
+
+	free := newFastSchedulerTestAccount(2, HealthTierHealthy, 100, 1)
+	free.PlanType = "free"
+
+	store := &Store{
+		accounts:       []*Account{plus, free},
+		maxConcurrency: 1,
+	}
+	store.fastSchedulerEnabled.Store(true)
+	store.fastScheduler.Store(store.BuildFastScheduler())
+
+	got := store.WaitForAvailableMatching(t.Context(), 200*time.Millisecond, nil, func(acc *Account) bool {
+		return acc.GetPlanType() == "free"
+	})
+	if got == nil {
+		t.Fatal("WaitForAvailableMatching() returned nil")
+	}
+	defer store.Release(got)
+	if got.DBID != free.DBID {
+		t.Fatalf("WaitForAvailableMatching() picked dbID=%d, want free dbID=%d", got.DBID, free.DBID)
 	}
 }

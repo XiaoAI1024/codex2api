@@ -78,6 +78,134 @@ function roundTo2(value: number): number {
   return Math.round(value * 100) / 100
 }
 
+type QuotaRateConfig = {
+  plus: number
+  pro: number
+  team: number
+}
+
+type QuotaStatsFree = {
+  accountCount: number
+  quotaTotal: number
+  quotaUsed: number
+  quotaRemaining: number
+  quotaUsedPercent: number
+  quotaRemainingPercent: number
+  quotaUsedAccounts: number
+  quotaRemainingAccounts: number
+}
+
+type QuotaStatsWindowed = {
+  accountCount: number
+  quotaTotal: number
+  usage5hUsed: number
+  usage5hRemaining: number
+  usage5hUsedPercent: number
+  usage5hRemainingPercent: number
+  usage5hUsedAccounts: number
+  usage5hRemainingAccounts: number
+  usage7dUsed: number
+  usage7dRemaining: number
+  usage7dUsedPercent: number
+  usage7dRemainingPercent: number
+  usage7dUsedAccounts: number
+  usage7dRemainingAccounts: number
+  waiting5hCount: number
+  waiting7dCount: number
+}
+
+function normalizeRate(value: number, fallback: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    return fallback
+  }
+  return value
+}
+
+function resolvePlanWeight(planType: string | undefined, rates: QuotaRateConfig): number {
+  const plan = (planType || '').toLowerCase()
+  if (plan === 'pro') return rates.pro
+  if (plan === 'plus') return rates.plus
+  if (plan === 'team') return rates.team
+  if (plan === 'free') return 1
+  return rates.team
+}
+
+function calcWeightedTotal(accounts: AccountRow[], rates: QuotaRateConfig): number {
+  return accounts.reduce((sum, account) => sum + resolvePlanWeight(account.plan_type, rates) * 100, 0)
+}
+
+function calcWeightedUsed(accounts: AccountRow[], rates: QuotaRateConfig, usageKey: 'usage_percent_5h' | 'usage_percent_7d'): number {
+  return accounts.reduce((sum, account) => {
+    const weight = resolvePlanWeight(account.plan_type, rates)
+    const usedPercent = clampUsagePercent(account[usageKey])
+    return sum + weight * usedPercent
+  }, 0)
+}
+
+function calcWaitCount(accounts: AccountRow[], waitType: '5h' | '7d'): number {
+  return accounts.filter((account) => {
+    if (!account.wait_mode) return false
+    const waitReason = (account.wait_reason || '').toLowerCase()
+    const status = (account.status || '').toLowerCase()
+    if (waitType === '5h') {
+      return waitReason === 'rate_limited' || status === 'rate_limited'
+    }
+    return waitReason === 'full_usage' || status === 'full_usage'
+  }).length
+}
+
+function calcFreeQuotaStats(accounts: AccountRow[], rates: QuotaRateConfig): QuotaStatsFree {
+  const quotaTotal = calcWeightedTotal(accounts, rates)
+  const quotaUsed = calcWeightedUsed(accounts, rates, 'usage_percent_7d')
+  const quotaRemaining = Math.max(0, quotaTotal - quotaUsed)
+  const quotaUsedPercent = quotaTotal > 0 ? roundTo2((quotaUsed / quotaTotal) * 100) : 0
+  const quotaRemainingPercent = quotaTotal > 0 ? roundTo2((quotaRemaining / quotaTotal) * 100) : 0
+  return {
+    accountCount: accounts.length,
+    quotaTotal: roundTo2(quotaTotal),
+    quotaUsed: roundTo2(quotaUsed),
+    quotaRemaining: roundTo2(quotaRemaining),
+    quotaUsedPercent,
+    quotaRemainingPercent,
+    quotaUsedAccounts: roundTo2(quotaUsed / 100),
+    quotaRemainingAccounts: roundTo2(quotaRemaining / 100),
+  }
+}
+
+function calcWindowedQuotaStats(accounts: AccountRow[], rates: QuotaRateConfig): QuotaStatsWindowed {
+  const quotaTotal = calcWeightedTotal(accounts, rates)
+  const usage5hUsed = calcWeightedUsed(accounts, rates, 'usage_percent_5h')
+  const usage5hRemaining = Math.max(0, quotaTotal - usage5hUsed)
+  const usage7dUsed = calcWeightedUsed(accounts, rates, 'usage_percent_7d')
+  const usage7dRemaining = Math.max(0, quotaTotal - usage7dUsed)
+  return {
+    accountCount: accounts.length,
+    quotaTotal: roundTo2(quotaTotal),
+    usage5hUsed: roundTo2(usage5hUsed),
+    usage5hRemaining: roundTo2(usage5hRemaining),
+    usage5hUsedPercent: quotaTotal > 0 ? roundTo2((usage5hUsed / quotaTotal) * 100) : 0,
+    usage5hRemainingPercent: quotaTotal > 0 ? roundTo2((usage5hRemaining / quotaTotal) * 100) : 0,
+    usage5hUsedAccounts: roundTo2(usage5hUsed / 100),
+    usage5hRemainingAccounts: roundTo2(usage5hRemaining / 100),
+    usage7dUsed: roundTo2(usage7dUsed),
+    usage7dRemaining: roundTo2(usage7dRemaining),
+    usage7dUsedPercent: quotaTotal > 0 ? roundTo2((usage7dUsed / quotaTotal) * 100) : 0,
+    usage7dRemainingPercent: quotaTotal > 0 ? roundTo2((usage7dRemaining / quotaTotal) * 100) : 0,
+    usage7dUsedAccounts: roundTo2(usage7dUsed / 100),
+    usage7dRemainingAccounts: roundTo2(usage7dRemaining / 100),
+    waiting5hCount: calcWaitCount(accounts, '5h'),
+    waiting7dCount: calcWaitCount(accounts, '7d'),
+  }
+}
+
+function formatMetric(value: number, fractionDigits = 2): string {
+  if (!Number.isFinite(value)) return '0'
+  return value.toLocaleString(undefined, {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: fractionDigits,
+  })
+}
+
 function formatUSD(value?: number | null): string {
   const amount = typeof value === 'number' && Number.isFinite(value) ? value : 0
   return amount.toFixed(4).replace(/\.?0+$/, '')
@@ -143,6 +271,11 @@ export default function Accounts() {
   const [oauthName, setOauthName] = useState('')
   const [oauthGenerating, setOauthGenerating] = useState(false)
   const [oauthCompleting, setOauthCompleting] = useState(false)
+  const [quotaRates, setQuotaRates] = useState<QuotaRateConfig>({
+    plus: 10,
+    pro: 100,
+    team: 10,
+  })
   const fileInputRef = useRef<HTMLInputElement>(null)
   const jsonInputRef = useRef<HTMLInputElement>(null)
   const atFileInputRef = useRef<HTMLInputElement>(null)
@@ -159,6 +292,27 @@ export default function Accounts() {
     load: loadAccounts,
   })
   const usageBootstrapReloadedRef = useRef(false)
+
+  const loadQuotaRates = useCallback(async () => {
+    try {
+      const settings = await api.getSettings()
+      setQuotaRates({
+        plus: normalizeRate(settings.quota_rate_plus ?? 10, 10),
+        pro: normalizeRate(settings.quota_rate_pro ?? 100, 100),
+        team: normalizeRate(settings.quota_rate_team ?? 10, 10),
+      })
+    } catch {
+      setQuotaRates({
+        plus: 10,
+        pro: 100,
+        team: 10,
+      })
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadQuotaRates()
+  }, [loadQuotaRates])
 
   useEffect(() => {
     const hasMissingUsage = accounts.some(
@@ -189,16 +343,37 @@ export default function Accounts() {
   const healthyAccounts = accounts.filter((account) => account.health_tier === 'healthy').length
   const warmAccounts = accounts.filter((account) => account.health_tier === 'warm').length
   const riskyAccounts = accounts.filter((account) => account.health_tier === 'risky').length
-  const quotaSourceAccounts = accounts.filter((account) => account.status !== 'unauthorized')
-  const quotaAccountCount = quotaSourceAccounts.length
-  const quotaTotal = quotaAccountCount * 100
-  const quotaUsed = Math.round(
-    quotaSourceAccounts.reduce((sum, account) => sum + clampUsagePercent(account.usage_percent_7d), 0)
-  )
-  const quotaRemaining = Math.max(0, quotaTotal - quotaUsed)
-  const quotaUsedPercent = quotaTotal > 0 ? roundTo2((quotaUsed / quotaTotal) * 100) : 0
-  const quotaRemainingPercent = quotaTotal > 0 ? roundTo2((quotaRemaining / quotaTotal) * 100) : 0
-  const quotaRemainingAccounts = roundTo2(quotaRemaining / 100)
+  const quotaSourceAccounts = accounts.filter((account) => (account.status || '').toLowerCase() !== 'unauthorized')
+  const freeQuotaAccounts = quotaSourceAccounts.filter((account) => (account.plan_type || '').toLowerCase() === 'free')
+  const paidQuotaAccounts = quotaSourceAccounts.filter((account) => (account.plan_type || '').toLowerCase() !== 'free')
+  const freeQuotaStats = calcFreeQuotaStats(freeQuotaAccounts, quotaRates)
+  const paidQuotaStats = calcWindowedQuotaStats(paidQuotaAccounts, quotaRates)
+  const totalQuota = calcWeightedTotal(quotaSourceAccounts, quotaRates)
+  const freeUsedBaseForTotal = calcWeightedUsed(freeQuotaAccounts, quotaRates, 'usage_percent_7d')
+  const paidUsed5hForTotal = calcWeightedUsed(paidQuotaAccounts, quotaRates, 'usage_percent_5h')
+  const paidUsed7dForTotal = calcWeightedUsed(paidQuotaAccounts, quotaRates, 'usage_percent_7d')
+  const totalUsed5h = freeUsedBaseForTotal + paidUsed5hForTotal
+  const totalUsed7d = freeUsedBaseForTotal + paidUsed7dForTotal
+  const totalRemaining5h = Math.max(0, totalQuota - totalUsed5h)
+  const totalRemaining7d = Math.max(0, totalQuota - totalUsed7d)
+  const totalQuotaStats: QuotaStatsWindowed = {
+    accountCount: quotaSourceAccounts.length,
+    quotaTotal: roundTo2(totalQuota),
+    usage5hUsed: roundTo2(totalUsed5h),
+    usage5hRemaining: roundTo2(totalRemaining5h),
+    usage5hUsedPercent: totalQuota > 0 ? roundTo2((totalUsed5h / totalQuota) * 100) : 0,
+    usage5hRemainingPercent: totalQuota > 0 ? roundTo2((totalRemaining5h / totalQuota) * 100) : 0,
+    usage5hUsedAccounts: roundTo2(totalUsed5h / 100),
+    usage5hRemainingAccounts: roundTo2(totalRemaining5h / 100),
+    usage7dUsed: roundTo2(totalUsed7d),
+    usage7dRemaining: roundTo2(totalRemaining7d),
+    usage7dUsedPercent: totalQuota > 0 ? roundTo2((totalUsed7d / totalQuota) * 100) : 0,
+    usage7dRemainingPercent: totalQuota > 0 ? roundTo2((totalRemaining7d / totalQuota) * 100) : 0,
+    usage7dUsedAccounts: roundTo2(totalUsed7d / 100),
+    usage7dRemainingAccounts: roundTo2(totalRemaining7d / 100),
+    waiting5hCount: calcWaitCount(quotaSourceAccounts, '5h'),
+    waiting7dCount: calcWaitCount(quotaSourceAccounts, '7d'),
+  }
 
   const filteredAccounts = accounts.filter((account) => {
     // 状态过滤
@@ -894,15 +1069,41 @@ export default function Accounts() {
           <CompactStat label={t('accounts.bannedAccounts')} chipLabel={t('accounts.filterBanned')} value={bannedAccounts} tone="danger" />
         </div>
 
-        <div className="mb-2 text-[12px] font-semibold text-muted-foreground">{t('accounts.quotaSectionTitle')}</div>
-        <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
-          <CompactStat label={t('accounts.quotaAccountCount')} value={quotaAccountCount} tone="neutral" />
-          <CompactStat label={t('accounts.quotaTotal')} value={quotaTotal.toLocaleString()} tone="neutral" />
-          <CompactStat label={t('accounts.quotaUsed')} value={quotaUsed.toLocaleString()} tone="warning" />
-          <CompactStat label={t('accounts.quotaRemaining')} value={quotaRemaining.toLocaleString()} tone="success" />
-          <CompactStat label={t('accounts.quotaUsedPercent')} value={`${quotaUsedPercent.toFixed(2)}%`} tone="warning" />
-          <CompactStat label={t('accounts.quotaRemainingPercent')} value={`${quotaRemainingPercent.toFixed(2)}%`} tone="success" />
-          <CompactStat label={t('accounts.quotaRemainingAccounts')} value={quotaRemainingAccounts.toFixed(2)} tone="success" />
+        <div className="mb-2 text-[12px] font-semibold text-muted-foreground">{t('accounts.quotaSectionFreeTitle')}</div>
+        <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-5">
+          <CompactStat label={t('accounts.quotaAccountCount')} value={freeQuotaStats.accountCount} tone="neutral" />
+          <CompactStat label={t('accounts.quotaTotal')} value={formatMetric(freeQuotaStats.quotaTotal)} tone="neutral" />
+          <CompactStat label={t('accounts.quotaRemaining')} value={formatMetric(freeQuotaStats.quotaRemaining)} tone="success" />
+          <CompactStat label={t('accounts.quotaRemainingPercent')} value={`${freeQuotaStats.quotaRemainingPercent.toFixed(2)}%`} tone="cyan" />
+          <CompactStat label={t('accounts.quotaRemainingAccounts')} value={formatMetric(freeQuotaStats.quotaRemainingAccounts)} tone="cyan" />
+        </div>
+
+        <div className="mb-2 text-[12px] font-semibold text-muted-foreground">{t('accounts.quotaSectionPaidTitle')}</div>
+        <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-5">
+          <CompactStat label={t('accounts.quotaAccountCount')} value={paidQuotaStats.accountCount} tone="neutral" />
+          <CompactStat label={t('accounts.quotaTotal')} value={formatMetric(paidQuotaStats.quotaTotal)} tone="neutral" />
+          <CompactStat label={t('accounts.quota5hRemaining')} value={formatMetric(paidQuotaStats.usage5hRemaining)} tone="success" />
+          <CompactStat label={t('accounts.quota5hRemainingPercent')} value={`${paidQuotaStats.usage5hRemainingPercent.toFixed(2)}%`} tone="cyan" />
+          <CompactStat label={t('accounts.quota5hRemainingAccounts')} value={formatMetric(paidQuotaStats.usage5hRemainingAccounts)} tone="cyan" />
+          <CompactStat label={t('accounts.quota5hWaitingCount')} value={paidQuotaStats.waiting5hCount} tone="warning" />
+          <CompactStat label={t('accounts.quota7dWaitingCount')} value={paidQuotaStats.waiting7dCount} tone="warning" />
+          <CompactStat label={t('accounts.quota7dRemaining')} value={formatMetric(paidQuotaStats.usage7dRemaining)} tone="success" />
+          <CompactStat label={t('accounts.quota7dRemainingPercent')} value={`${paidQuotaStats.usage7dRemainingPercent.toFixed(2)}%`} tone="cyan" />
+          <CompactStat label={t('accounts.quota7dRemainingAccounts')} value={formatMetric(paidQuotaStats.usage7dRemainingAccounts)} tone="cyan" />
+        </div>
+
+        <div className="mb-2 text-[12px] font-semibold text-muted-foreground">{t('accounts.quotaSectionTotalTitle')}</div>
+        <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-5">
+          <CompactStat label={t('accounts.quotaAccountCount')} value={totalQuotaStats.accountCount} tone="neutral" />
+          <CompactStat label={t('accounts.quotaTotal')} value={formatMetric(totalQuotaStats.quotaTotal)} tone="neutral" />
+          <CompactStat label={t('accounts.quota5hRemaining')} value={formatMetric(totalQuotaStats.usage5hRemaining)} tone="success" />
+          <CompactStat label={t('accounts.quota5hRemainingPercent')} value={`${totalQuotaStats.usage5hRemainingPercent.toFixed(2)}%`} tone="cyan" />
+          <CompactStat label={t('accounts.quota5hRemainingAccounts')} value={formatMetric(totalQuotaStats.usage5hRemainingAccounts)} tone="cyan" />
+          <CompactStat label={t('accounts.quota5hWaitingCount')} value={totalQuotaStats.waiting5hCount} tone="warning" />
+          <CompactStat label={t('accounts.quota7dWaitingCount')} value={totalQuotaStats.waiting7dCount} tone="warning" />
+          <CompactStat label={t('accounts.quota7dRemaining')} value={formatMetric(totalQuotaStats.usage7dRemaining)} tone="success" />
+          <CompactStat label={t('accounts.quota7dRemainingPercent')} value={`${totalQuotaStats.usage7dRemainingPercent.toFixed(2)}%`} tone="cyan" />
+          <CompactStat label={t('accounts.quota7dRemainingAccounts')} value={formatMetric(totalQuotaStats.usage7dRemainingAccounts)} tone="cyan" />
         </div>
 
         <div className="mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-border bg-white/55 px-4 py-3 text-[12px] text-muted-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.72)]">
@@ -1670,7 +1871,7 @@ function CompactStat({
   label: string
   chipLabel?: string
   value: number | string
-  tone: 'neutral' | 'success' | 'warning' | 'danger'
+  tone: 'neutral' | 'success' | 'warning' | 'danger' | 'cyan'
 }) {
   const toneStyle = {
     neutral: {
@@ -1688,6 +1889,10 @@ function CompactStat({
     danger: {
       chip: 'bg-red-500/10 text-red-600 dark:bg-red-500/20 dark:text-red-300',
       dot: 'bg-red-500',
+    },
+    cyan: {
+      chip: 'bg-cyan-500/10 text-cyan-600 dark:bg-cyan-500/20 dark:text-cyan-300',
+      dot: 'bg-cyan-500',
     },
   }[tone]
 

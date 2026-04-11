@@ -238,6 +238,11 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 			log.Printf("OAuth 账号 %d AT 刷新失败: %v", accountID, err)
 		} else {
 			log.Printf("OAuth 账号 %d 已加入号池", accountID)
+			syncCtx, syncCancel := context.WithTimeout(context.Background(), 25*time.Second)
+			defer syncCancel()
+			if err := h.forceSyncPlanFromWhamUsageByID(syncCtx, accountID); err != nil {
+				log.Printf("OAuth 账号 %d 套餐同步失败: %v", accountID, err)
+			}
 		}
 	}(id)
 
