@@ -192,9 +192,9 @@ func classifyTransportFailure(err error) string {
 	return "transport"
 }
 
-func classifyHTTPFailure(statusCode int) string {
+func classifyHTTPFailure(statusCode int, body []byte) string {
 	switch {
-	case statusCode == http.StatusUnauthorized:
+	case isUnauthorizedLikeStatus(statusCode, body):
 		return "unauthorized"
 	case statusCode == http.StatusTooManyRequests:
 		return "" // 429 由 applyCooldown 单独处理
@@ -590,7 +590,7 @@ const (
 	logStatusUpstreamStreamBreak = 598
 )
 
-func isRetryableWorkspaceError(code int, body []byte) bool {
+func isDeactivatedWorkspaceError(code int, body []byte) bool {
 	if code != http.StatusPaymentRequired || len(body) == 0 {
 		return false
 	}
@@ -598,12 +598,30 @@ func isRetryableWorkspaceError(code int, body []byte) bool {
 	return strings.EqualFold(strings.TrimSpace(errCode), "deactivated_workspace")
 }
 
+func isUnauthorizedLikeStatus(code int, body []byte) bool {
+	return code == http.StatusUnauthorized || isDeactivatedWorkspaceError(code, body)
+}
+
+// IsUnauthorizedLikeStatus 返回该上游状态是否应按封禁/401 处理。
+func IsUnauthorizedLikeStatus(code int, body []byte) bool {
+	return isUnauthorizedLikeStatus(code, body)
+}
+
+func normalizeUpstreamStatusCode(code int, body []byte) int {
+	if isUnauthorizedLikeStatus(code, body) {
+		return http.StatusUnauthorized
+	}
+	return code
+}
+
+// NormalizeUpstreamStatusCode 将需要按 401 对待的上游错误归一化为 401。
+func NormalizeUpstreamStatusCode(code int, body []byte) int {
+	return normalizeUpstreamStatusCode(code, body)
+}
+
 // isRetryableStatus 检查是否可重试的上游状态码
 func isRetryableStatus(code int, body []byte) bool {
-	if code == http.StatusUnauthorized || code == http.StatusTooManyRequests {
-		return true
-	}
-	if isRetryableWorkspaceError(code, body) {
+	if isUnauthorizedLikeStatus(code, body) || code == http.StatusTooManyRequests {
 		return true
 	}
 	return code >= 500 && code <= 599
@@ -671,6 +689,39 @@ func parseUpstreamErrorBrief(body []byte) (code string, message string) {
 		message = strings.TrimSpace(gjson.GetBytes(body, "message").String())
 	}
 	return code, message
+}
+
+// ParseUpstreamErrorBrief 提取统一的上游错误 code/message，兼容 error/detail 两种结构。
+func ParseUpstreamErrorBrief(body []byte) (code string, message string) {
+	return parseUpstreamErrorBrief(body)
+}
+
+func (h *Handler) applyUnauthorizedCooldown(account *auth.Account, upstreamStatusCode int, body []byte) {
+	errCode, errMsg := parseUpstreamErrorBrief(body)
+	if errCode == "" && upstreamStatusCode == http.StatusPaymentRequired {
+		errCode = "deactivated_workspace"
+	}
+	if errMsg == "" {
+		errMsg = http.StatusText(http.StatusUnauthorized)
+	}
+	account.SetLastFailureDetail(http.StatusUnauthorized, errCode, errMsg)
+	// 原子标志瞬间置位，阻止其他并发请求再选到该账号
+	atomic.StoreInt32(&account.Disabled, 1)
+
+	if h.store.GetAutoCleanUnauthorized() {
+		log.Printf("账号 %d 收到封禁类错误(上游 %d/%s)，立即清理", account.ID(), upstreamStatusCode, errCode)
+		if h.db != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_ = h.db.SetError(ctx, account.ID(), "deleted")
+			cancel()
+			h.db.InsertAccountEventAsync(account.ID(), "deleted", "auto_clean_unauthorized")
+		}
+		h.store.RemoveAccount(account.ID())
+		return
+	}
+
+	log.Printf("账号 %d 收到封禁类错误(上游 %d/%s)，按 401 封禁处理", account.ID(), upstreamStatusCode, errCode)
+	h.store.MarkCooldown(account, 5*time.Minute, "unauthorized")
 }
 
 // Responses 处理 /v1/responses 请求（原生透传，增强输入验证）
@@ -847,11 +898,11 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
-			}
 			h.persistUsageAndSettleFromResponse(account, resp)
 			errBody, _ := io.ReadAll(resp.Body)
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" {
+				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			}
 			resp.Body.Close()
 			logUpstreamAttemptResult(c, "/v1/responses", attempt+1, account, proxyURL, resp.StatusCode, durationMs, requestStartedAt, fmt.Sprintf("http_%d", resp.StatusCode))
 			h.store.Release(account)
@@ -1291,11 +1342,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
-			}
 			h.persistUsageAndSettleFromResponse(account, resp)
 			errBody, _ := io.ReadAll(resp.Body)
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" {
+				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			}
 			resp.Body.Close()
 			logUpstreamAttemptResult(c, "/v1/chat/completions", attempt+1, account, proxyURL, resp.StatusCode, durationMs, requestStartedAt, fmt.Sprintf("http_%d", resp.StatusCode))
 			h.store.Release(account)
@@ -1795,39 +1846,12 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 		log.Printf("账号 %d 被限速 (plan=%s)，进入等待模式 %v（2小时测活一次）", account.ID(), account.GetPlanType(), cooldown)
 		h.store.MarkCooldown(account, cooldown, "rate_limited")
 	case http.StatusUnauthorized:
-		errCode, errMsg := parseUpstreamErrorBrief(body)
-		account.SetLastFailureDetail(statusCode, errCode, errMsg)
-		// 原子标志瞬间置位，阻止其他并发请求再选到该账号
-		atomic.StoreInt32(&account.Disabled, 1)
-
-		if h.store.GetAutoCleanUnauthorized() {
-			// 开启自动清理时，401 立即从号池删除
-			log.Printf("账号 %d 收到 401，立即清理", account.ID())
-			if h.db != nil {
-				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-				_ = h.db.SetError(ctx, account.ID(), "deleted")
-				cancel()
-				h.db.InsertAccountEventAsync(account.ID(), "deleted", "auto_clean_401")
-			}
-			h.store.RemoveAccount(account.ID())
-		} else {
-			h.store.MarkCooldown(account, 5*time.Minute, "unauthorized")
-		}
+		h.applyUnauthorizedCooldown(account, statusCode, body)
 	case http.StatusPaymentRequired:
-		if !isRetryableWorkspaceError(statusCode, body) {
+		if !isDeactivatedWorkspaceError(statusCode, body) {
 			return
 		}
-		errCode, errMsg := parseUpstreamErrorBrief(body)
-		if errCode == "" {
-			errCode = "deactivated_workspace"
-		}
-		if errMsg == "" {
-			errMsg = "Workspace has been deactivated"
-		}
-		account.SetLastFailureDetail(statusCode, errCode, errMsg)
-		cooldown := 6 * time.Hour
-		log.Printf("账号 %d 返回 402/%s，进入等待模式 %v 并允许当前请求切号重试", account.ID(), errCode, cooldown)
-		h.store.MarkCooldown(account, cooldown, "workspace_deactivated")
+		h.applyUnauthorizedCooldown(account, statusCode, body)
 	}
 }
 
@@ -1999,6 +2023,7 @@ func parseFloat(s string) float64 {
 
 // sendUpstreamError 发送上游错误响应给客户端
 func (h *Handler) sendUpstreamError(c *gin.Context, statusCode int, body []byte) {
+	statusCode = normalizeUpstreamStatusCode(statusCode, body)
 	c.JSON(statusCode, gin.H{
 		"error": gin.H{
 			"message": fmt.Sprintf("上游返回错误 (status %d): %s", statusCode, string(body)),
@@ -2040,7 +2065,7 @@ func (h *Handler) sendFinalUpstreamError(c *gin.Context, statusCode int, body []
 		}
 	}
 
-	h.sendUpstreamError(c, statusCode, body)
+	h.sendUpstreamError(c, normalizeUpstreamStatusCode(statusCode, body), body)
 }
 
 // handleUpstreamError 统一处理上游错误（兼容旧调用）

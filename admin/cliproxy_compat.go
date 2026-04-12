@@ -780,18 +780,18 @@ func (h *Handler) validatePublicUploadedAccount(ctx context.Context, accountID i
 			h.store.PersistUsageSnapshot(account, usagePct)
 		}
 		errBody, _ := io.ReadAll(resp.Body)
-		errCode := strings.TrimSpace(gjson.GetBytes(errBody, "error.code").String())
-		errMsg := strings.TrimSpace(gjson.GetBytes(errBody, "error.message").String())
-		account.SetLastFailureDetail(resp.StatusCode, errCode, errMsg)
-		switch resp.StatusCode {
-		case http.StatusUnauthorized:
+		errCode, errMsg := proxy.ParseUpstreamErrorBrief(errBody)
+		displayStatus := proxy.NormalizeUpstreamStatusCode(resp.StatusCode, errBody)
+		account.SetLastFailureDetail(displayStatus, errCode, errMsg)
+		switch {
+		case proxy.IsUnauthorizedLikeStatus(resp.StatusCode, errBody):
 			h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
-		case http.StatusTooManyRequests:
+		case resp.StatusCode == http.StatusTooManyRequests:
 			if !h.store.MarkFullUsageCooldownFromSnapshot(account) {
 				h.store.MarkCooldown(account, auth.RateLimitedProbeInterval, "rate_limited")
 			}
 		}
-		return fmt.Errorf("上游返回 %d: %s", resp.StatusCode, truncate(string(errBody), 500))
+		return fmt.Errorf("上游返回 %d: %s", displayStatus, truncate(string(errBody), 500))
 	}
 
 	if usagePct, ok := proxy.ParseCodexUsageHeaders(resp, account); ok {

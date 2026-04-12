@@ -42,22 +42,38 @@ func TestApplyCooldown_DeactivatedWorkspace(t *testing.T) {
 
 	handler.applyCooldown(account, http.StatusPaymentRequired, []byte(`{"detail":{"code":"deactivated_workspace"}}`), nil)
 
-	if account.RuntimeStatus() != "workspace_deactivated" {
-		t.Fatalf("runtime status = %q, want %q", account.RuntimeStatus(), "workspace_deactivated")
+	if account.RuntimeStatus() != "unauthorized" {
+		t.Fatalf("runtime status = %q, want %q", account.RuntimeStatus(), "unauthorized")
 	}
 	statusCode, code, _ := account.GetLastFailureDetail()
-	if statusCode != http.StatusPaymentRequired || code != "deactivated_workspace" {
-		t.Fatalf("last failure = (%d,%q), want (%d,%q)", statusCode, code, http.StatusPaymentRequired, "deactivated_workspace")
+	if statusCode != http.StatusUnauthorized || code != "deactivated_workspace" {
+		t.Fatalf("last failure = (%d,%q), want (%d,%q)", statusCode, code, http.StatusUnauthorized, "deactivated_workspace")
 	}
 	until, reason, active := account.GetCooldownSnapshot()
 	if !active {
 		t.Fatal("expected cooldown to be active")
 	}
-	if reason != "workspace_deactivated" {
-		t.Fatalf("cooldown reason = %q, want %q", reason, "workspace_deactivated")
+	if reason != "unauthorized" {
+		t.Fatalf("cooldown reason = %q, want %q", reason, "unauthorized")
 	}
-	if time.Until(until) < 5*time.Hour {
+	if time.Until(until) < 5*time.Minute {
 		t.Fatalf("cooldown too short: until=%s", until.Format(time.RFC3339))
+	}
+}
+
+func TestSendUpstreamError_NormalizesDeactivatedWorkspaceTo401(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+
+	handler := &Handler{}
+	body := []byte(`{"detail":{"code":"deactivated_workspace"}}`)
+
+	handler.sendUpstreamError(ctx, http.StatusPaymentRequired, body)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUnauthorized)
 	}
 }
 

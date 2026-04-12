@@ -173,10 +173,12 @@ func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account)
 		h.store.PersistUsageSnapshot(account, usagePct)
 	}
 
-	_, _ = io.Copy(io.Discard, resp.Body)
+	body, _ := io.ReadAll(resp.Body)
+	displayStatus := proxy.NormalizeUpstreamStatusCode(resp.StatusCode, body)
+	errCode, errMsg := proxy.ParseUpstreamErrorBrief(body)
 
-	switch resp.StatusCode {
-	case http.StatusOK:
+	switch {
+	case resp.StatusCode == http.StatusOK:
 		h.store.ReportRequestSuccess(account, 0)
 		h.tryAutoSyncPlanFromWhamUsage(ctx, account)
 		if _, cooldownReason, active := account.GetCooldownSnapshot(); active && cooldownReason == "full_usage" {
@@ -188,12 +190,18 @@ func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account)
 		}
 		h.store.ClearCooldown(account)
 		return nil
-	case http.StatusUnauthorized:
-		account.SetLastFailureDetail(http.StatusUnauthorized, "unauthorized", "Unauthorized")
-		h.store.ReportRequestFailure(account, "client", 0)
+	case proxy.IsUnauthorizedLikeStatus(resp.StatusCode, body):
+		if errCode == "" {
+			errCode = "unauthorized"
+		}
+		if errMsg == "" {
+			errMsg = "Unauthorized"
+		}
+		account.SetLastFailureDetail(displayStatus, errCode, errMsg)
+		h.store.ReportRequestFailure(account, "unauthorized", 0)
 		h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
 		return nil
-	case http.StatusTooManyRequests:
+	case resp.StatusCode == http.StatusTooManyRequests:
 		account.SetLastFailureDetail(http.StatusTooManyRequests, "rate_limited", "Rate limited")
 		h.store.ReportRequestFailure(account, "client", 0)
 		if _, cooldownReason, _ := account.GetCooldownSnapshot(); cooldownReason == "full_usage" {
