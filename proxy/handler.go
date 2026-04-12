@@ -590,9 +590,20 @@ const (
 	logStatusUpstreamStreamBreak = 598
 )
 
+func isRetryableWorkspaceError(code int, body []byte) bool {
+	if code != http.StatusPaymentRequired || len(body) == 0 {
+		return false
+	}
+	errCode, _ := parseUpstreamErrorBrief(body)
+	return strings.EqualFold(strings.TrimSpace(errCode), "deactivated_workspace")
+}
+
 // isRetryableStatus 检查是否可重试的上游状态码
-func isRetryableStatus(code int) bool {
+func isRetryableStatus(code int, body []byte) bool {
 	if code == http.StatusUnauthorized || code == http.StatusTooManyRequests {
+		return true
+	}
+	if isRetryableWorkspaceError(code, body) {
 		return true
 	}
 	return code >= 500 && code <= 599
@@ -644,8 +655,22 @@ func parseUpstreamErrorBrief(body []byte) (code string, message string) {
 	if len(body) == 0 {
 		return "", ""
 	}
-	return strings.TrimSpace(gjson.GetBytes(body, "error.code").String()),
-		strings.TrimSpace(gjson.GetBytes(body, "error.message").String())
+	code = strings.TrimSpace(gjson.GetBytes(body, "error.code").String())
+	if code == "" {
+		code = strings.TrimSpace(gjson.GetBytes(body, "detail.code").String())
+	}
+	if code == "" {
+		code = strings.TrimSpace(gjson.GetBytes(body, "code").String())
+	}
+
+	message = strings.TrimSpace(gjson.GetBytes(body, "error.message").String())
+	if message == "" {
+		message = strings.TrimSpace(gjson.GetBytes(body, "detail.message").String())
+	}
+	if message == "" {
+		message = strings.TrimSpace(gjson.GetBytes(body, "message").String())
+	}
+	return code, message
 }
 
 // Responses 处理 /v1/responses 请求（原生透传，增强输入验证）
@@ -855,7 +880,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.forceDeleteAccount(account.ID(), "auto_clean_no_organization")
 			}
 
-			if isRetryableStatus(resp.StatusCode) && attempt < maxRetries {
+			if isRetryableStatus(resp.StatusCode, errBody) && attempt < maxRetries {
 				continue
 			}
 
@@ -1299,7 +1324,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.forceDeleteAccount(account.ID(), "auto_clean_no_organization")
 			}
 
-			if isRetryableStatus(resp.StatusCode) && attempt < maxRetries {
+			if isRetryableStatus(resp.StatusCode, errBody) && attempt < maxRetries {
 				continue
 			}
 
@@ -1788,6 +1813,21 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 		} else {
 			h.store.MarkCooldown(account, 5*time.Minute, "unauthorized")
 		}
+	case http.StatusPaymentRequired:
+		if !isRetryableWorkspaceError(statusCode, body) {
+			return
+		}
+		errCode, errMsg := parseUpstreamErrorBrief(body)
+		if errCode == "" {
+			errCode = "deactivated_workspace"
+		}
+		if errMsg == "" {
+			errMsg = "Workspace has been deactivated"
+		}
+		account.SetLastFailureDetail(statusCode, errCode, errMsg)
+		cooldown := 6 * time.Hour
+		log.Printf("账号 %d 返回 402/%s，进入等待模式 %v 并允许当前请求切号重试", account.ID(), errCode, cooldown)
+		h.store.MarkCooldown(account, cooldown, "workspace_deactivated")
 	}
 }
 
