@@ -142,6 +142,16 @@ function calcWeightedUsed(accounts: AccountRow[], rates: QuotaRateConfig, usageK
   }, 0)
 }
 
+// 5h 可用额度需扣除 7d 窗口影响：按账号维度取 max(5h_used, 7d_used)
+function calcWeightedUsed5hEffective(accounts: AccountRow[], rates: QuotaRateConfig): number {
+  return accounts.reduce((sum, account) => {
+    const weight = resolvePlanWeight(account.plan_type, rates)
+    const used5h = clampUsagePercent(account.usage_percent_5h)
+    const used7d = clampUsagePercent(account.usage_percent_7d)
+    return sum + weight * Math.max(used5h, used7d)
+  }, 0)
+}
+
 function isUsageFull(value?: number | null): boolean {
   if (value === null || value === undefined) return false
   if (!Number.isFinite(value)) return false
@@ -192,7 +202,7 @@ function calcFreeQuotaStats(accounts: AccountRow[], rates: QuotaRateConfig): Quo
 
 function calcWindowedQuotaStats(accounts: AccountRow[], rates: QuotaRateConfig): QuotaStatsWindowed {
   const quotaTotal = calcWeightedTotal(accounts, rates)
-  const usage5hUsed = calcWeightedUsed(accounts, rates, 'usage_percent_5h')
+  const usage5hUsed = calcWeightedUsed5hEffective(accounts, rates)
   const usage5hRemaining = Math.max(0, quotaTotal - usage5hUsed)
   const usage7dUsed = calcWeightedUsed(accounts, rates, 'usage_percent_7d')
   const usage7dRemaining = Math.max(0, quotaTotal - usage7dUsed)
@@ -369,11 +379,8 @@ export default function Accounts() {
   const freeQuotaStats = calcFreeQuotaStats(freeQuotaAccounts, quotaRates)
   const paidQuotaStats = calcWindowedQuotaStats(paidQuotaAccounts, quotaRates)
   const totalQuota = calcWeightedTotal(quotaSourceAccounts, quotaRates)
-  const freeUsedBaseForTotal = calcWeightedUsed(freeQuotaAccounts, quotaRates, 'usage_percent_7d')
-  const paidUsed5hForTotal = calcWeightedUsed(paidQuotaAccounts, quotaRates, 'usage_percent_5h')
-  const paidUsed7dForTotal = calcWeightedUsed(paidQuotaAccounts, quotaRates, 'usage_percent_7d')
-  const totalUsed5h = freeUsedBaseForTotal + paidUsed5hForTotal
-  const totalUsed7d = freeUsedBaseForTotal + paidUsed7dForTotal
+  const totalUsed5h = calcWeightedUsed5hEffective(quotaSourceAccounts, quotaRates)
+  const totalUsed7d = calcWeightedUsed(quotaSourceAccounts, quotaRates, 'usage_percent_7d')
   const totalRemaining5h = Math.max(0, totalQuota - totalUsed5h)
   const totalRemaining7d = Math.max(0, totalQuota - totalUsed7d)
   const totalQuotaStats: QuotaStatsWindowed = {
