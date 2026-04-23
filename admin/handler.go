@@ -2859,7 +2859,7 @@ func (h *Handler) importCompatAccountsCommon(c *gin.Context, items []compatImpor
 
 // ListModels 返回支持的模型列表（供前端设置页使用）
 func (h *Handler) ListModels(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"models": proxy.SupportedModels})
+	c.JSON(http.StatusOK, gin.H{"models": proxy.ListPublicModels()})
 }
 
 // ==================== 账号趋势 ====================

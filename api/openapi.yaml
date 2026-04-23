@@ -217,7 +217,7 @@ components:
           maxLength: 256
         reasoning_effort:
           type: string
-          enum: [low, medium, high]
+          enum: [low, medium, high, xhigh]
           description: Level of reasoning effort
         service_tier:
           type: string
@@ -363,7 +363,7 @@ components:
           properties:
             effort:
               type: string
-              enum: [low, medium, high]
+              enum: [low, medium, high, xhigh]
         service_tier:
           type: string
           enum: [auto, default, fast]
@@ -409,6 +409,152 @@ components:
               type: integer
         incomplete_details:
           type: object
+
+    ImagesGenerationRequest:
+      type: object
+      required:
+        - prompt
+      properties:
+        prompt:
+          type: string
+          description: Text prompt used to generate images
+        model:
+          type: string
+          description: Image model ID
+          default: gpt-image-2
+          example: gpt-image-2
+        response_format:
+          type: string
+          description: Output payload format
+          enum: [b64_json, url]
+          default: b64_json
+        size:
+          type: string
+          description: Requested output size
+          example: 1024x1024
+        quality:
+          type: string
+          description: Requested output quality
+        background:
+          type: string
+          description: Background style
+        output_format:
+          type: string
+          description: Image output format (e.g. png/jpeg/webp)
+        output_compression:
+          type: integer
+          description: Compression level for supported output formats
+        moderation:
+          type: string
+          description: Moderation mode
+        n:
+          type: integer
+          description: Ignored for compatibility and not forwarded upstream
+
+    ImagesEditsRequest:
+      type: object
+      required:
+        - prompt
+      properties:
+        prompt:
+          type: string
+          description: Text prompt describing the desired edit result
+        model:
+          type: string
+          description: Image model ID
+          default: gpt-image-2
+          example: gpt-image-2
+        image:
+          description: Base image input (single string URL/data URL or array form)
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                oneOf:
+                  - type: string
+                  - type: object
+                    properties:
+                      image_url:
+                        type: string
+        images:
+          type: array
+          description: Additional image inputs (JSON mode)
+          items:
+            oneOf:
+              - type: string
+              - type: object
+                properties:
+                  image_url:
+                    type: string
+                  url:
+                    type: string
+        mask:
+          description: Optional mask image URL/data URL
+          oneOf:
+            - type: string
+            - type: object
+              properties:
+                image_url:
+                  type: string
+                url:
+                  type: string
+        response_format:
+          type: string
+          description: Output payload format
+          enum: [b64_json, url]
+          default: b64_json
+        size:
+          type: string
+          description: Requested output size
+          example: 1024x1024
+        quality:
+          type: string
+          description: Requested output quality
+        background:
+          type: string
+          description: Background style
+        output_format:
+          type: string
+          description: Image output format (e.g. png/jpeg/webp)
+        output_compression:
+          type: integer
+          description: Compression level for supported output formats
+        input_fidelity:
+          type: string
+          description: Input fidelity mode
+        moderation:
+          type: string
+          description: Moderation mode
+        n:
+          type: integer
+          description: Ignored for compatibility and not forwarded upstream
+
+    ImageData:
+      type: object
+      properties:
+        b64_json:
+          type: string
+          description: Base64-encoded image data (without data URL prefix)
+        url:
+          type: string
+          description: Image URL (or data URL when URL mode is requested)
+        revised_prompt:
+          type: string
+          description: Prompt rewritten by the model, if provided upstream
+
+    ImagesResponse:
+      type: object
+      required:
+        - created
+        - data
+      properties:
+        created:
+          type: integer
+          description: Unix timestamp
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImageData'
 
 paths:
   /models:
@@ -583,6 +729,117 @@ paths:
                 type: string
         '400':
           description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /images/generations:
+    post:
+      summary: Generate images
+      description: |
+        OpenAI-compatible images generation endpoint.
+        Default model is `gpt-image-2`.
+      operationId: createImageGeneration
+      tags:
+        - Images
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImagesGenerationRequest'
+      responses:
+        '200':
+          description: Images response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImagesResponse'
+        '400':
+          description: Invalid request or unsupported model
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /images/edits:
+    post:
+      summary: Edit images
+      description: |
+        OpenAI-compatible images edit endpoint.
+        Current implementation supports JSON requests only.
+        Multipart requests return 400 with a clear unsupported message.
+      operationId: createImageEdit
+      tags:
+        - Images
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImagesEditsRequest'
+          multipart/form-data:
+            schema:
+              type: object
+              description: Reserved for future support; currently returns 400.
+      responses:
+        '200':
+          description: Images response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImagesResponse'
+        '400':
+          description: Invalid request or unsupported model/content type
           content:
             application/json:
               schema:

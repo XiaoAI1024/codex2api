@@ -240,8 +240,16 @@ func TestStreamTranslator_FunctionCall(t *testing.T) {
 		}
 	}`)
 	chunk, done = st.Translate(completedEvent)
+	if done {
+		t.Fatal("response.completed should not finish immediately")
+	}
+	if chunk != nil {
+		t.Fatal("response.completed should not emit final chunk immediately")
+	}
+
+	chunk, done = st.Finalize()
 	if !done {
-		t.Fatal("should be done after response.completed")
+		t.Fatal("Finalize should emit final chunk")
 	}
 	if chunk == nil {
 		t.Fatal("should emit final chunk")
@@ -275,8 +283,16 @@ func TestStreamTranslator_TextOnly(t *testing.T) {
 	// completed
 	completedEvent := []byte(`{"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":3}}}`)
 	chunk, done = st.Translate(completedEvent)
+	if done {
+		t.Fatal("response.completed should not finish immediately")
+	}
+	if chunk != nil {
+		t.Fatal("response.completed should not emit final chunk immediately")
+	}
+
+	chunk, done = st.Flush()
 	if !done {
-		t.Fatal("should be done")
+		t.Fatal("Flush should emit final chunk")
 	}
 	finishReason := gjson.GetBytes(chunk, "choices.0.finish_reason").String()
 	if finishReason != "stop" {
@@ -315,6 +331,63 @@ func TestStreamTranslator_MultipleFunctionCalls(t *testing.T) {
 
 	if st.nextIdx != 2 {
 		t.Fatalf("expected nextIdx 2, got %d", st.nextIdx)
+	}
+}
+
+func TestStreamTranslator_LateUsageArrivesAfterCompleted(t *testing.T) {
+	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", true)
+
+	firstCompleted := []byte(`{
+		"type":"response.completed",
+		"response":{"output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}]}
+	}`)
+	chunk, done := st.Translate(firstCompleted)
+	if done || chunk != nil {
+		t.Fatal("first completed without usage should only mark pending done")
+	}
+
+	lateUsageCompleted := []byte(`{
+		"type":"response.completed",
+		"response":{"usage":{"input_tokens":11,"output_tokens":7}}
+	}`)
+	chunk, done = st.Translate(lateUsageCompleted)
+	if !done {
+		t.Fatal("late usage should trigger final chunk")
+	}
+	if chunk == nil {
+		t.Fatal("late usage should emit final chunk")
+	}
+	if gjson.GetBytes(chunk, "usage.prompt_tokens").Int() != 11 {
+		t.Fatalf("expected prompt_tokens=11, got %d", gjson.GetBytes(chunk, "usage.prompt_tokens").Int())
+	}
+	if gjson.GetBytes(chunk, "usage.completion_tokens").Int() != 7 {
+		t.Fatalf("expected completion_tokens=7, got %d", gjson.GetBytes(chunk, "usage.completion_tokens").Int())
+	}
+
+	chunk, done = st.Finalize()
+	if done || chunk != nil {
+		t.Fatal("final chunk should only be emitted once")
+	}
+}
+
+func TestStreamTranslator_IncludeUsageFalseOmitsFinalUsage(t *testing.T) {
+	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", false)
+
+	completedEvent := []byte(`{
+		"type":"response.completed",
+		"response":{"usage":{"input_tokens":9,"output_tokens":4}}
+	}`)
+	chunk, done := st.Translate(completedEvent)
+	if done || chunk != nil {
+		t.Fatal("response.completed should not finish immediately")
+	}
+
+	chunk, done = st.Finalize()
+	if !done || chunk == nil {
+		t.Fatal("Finalize should emit final chunk once")
+	}
+	if gjson.GetBytes(chunk, "usage").Exists() {
+		t.Fatal("usage should be omitted when includeUsage=false")
 	}
 }
 

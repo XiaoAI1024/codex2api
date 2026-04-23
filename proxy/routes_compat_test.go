@@ -19,17 +19,23 @@ func TestRegisterRoutes_OpenAICompatibilityPaths(t *testing.T) {
 	h.RegisterRoutes(r)
 
 	cases := []struct {
-		method string
-		path   string
+		method       string
+		path         string
+		allowedCodes map[int]struct{}
 	}{
-		{method: http.MethodPost, path: "/v1/chat/completions"},
-		{method: http.MethodPost, path: "/chat/completions"},
-		{method: http.MethodPost, path: "/v1/responses"},
-		{method: http.MethodPost, path: "/responses"},
-		{method: http.MethodPost, path: "/v1/responses/compact"},
-		{method: http.MethodPost, path: "/responses/compact"},
-		{method: http.MethodGet, path: "/v1/models"},
-		{method: http.MethodGet, path: "/models"},
+		{method: http.MethodPost, path: "/v1/chat/completions", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
+		{method: http.MethodPost, path: "/chat/completions", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
+		{method: http.MethodPost, path: "/v1/responses", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
+		{method: http.MethodPost, path: "/responses", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
+		{method: http.MethodPost, path: "/v1/responses/compact", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
+		{method: http.MethodPost, path: "/responses/compact", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
+		// Images 路由尚未注册时允许 404；注册后会进入鉴权返回 401。
+		{method: http.MethodPost, path: "/v1/images/generations", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}, http.StatusNotFound: {}}},
+		{method: http.MethodPost, path: "/images/generations", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}, http.StatusNotFound: {}}},
+		{method: http.MethodPost, path: "/v1/images/edits", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}, http.StatusNotFound: {}}},
+		{method: http.MethodPost, path: "/images/edits", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}, http.StatusNotFound: {}}},
+		{method: http.MethodGet, path: "/v1/models", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
+		{method: http.MethodGet, path: "/models", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
 	}
 
 	for _, tc := range cases {
@@ -37,8 +43,8 @@ func TestRegisterRoutes_OpenAICompatibilityPaths(t *testing.T) {
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusUnauthorized {
-			t.Fatalf("%s %s status=%d, want %d", tc.method, tc.path, rec.Code, http.StatusUnauthorized)
+		if _, ok := tc.allowedCodes[rec.Code]; !ok {
+			t.Fatalf("%s %s status=%d, allowed=%v", tc.method, tc.path, rec.Code, tc.allowedCodes)
 		}
 	}
 }

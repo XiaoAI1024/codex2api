@@ -172,6 +172,11 @@ func extractReasoningEffort(body []byte) string {
 	return ""
 }
 
+// extractStreamIncludeUsage 提取 stream_options.include_usage 开关（OpenAI Chat Completions）。
+func extractStreamIncludeUsage(body []byte) bool {
+	return gjson.GetBytes(body, "stream_options.include_usage").Bool()
+}
+
 // extractServiceTier 从请求体提取服务等级
 func extractServiceTier(body []byte) string {
 	if tier := gjson.GetBytes(body, "service_tier").String(); tier != "" {
@@ -270,7 +275,7 @@ func shouldTransparentRetryStream(outcome streamOutcome, attempt int, maxRetries
 }
 
 func isTerminalUpstreamEvent(eventType string) bool {
-	return eventType == "response.completed" || eventType == "response.failed"
+	return eventType == "response.failed"
 }
 
 // isUserVisibleDeltaEvent 判断事件是否已经产生对下游可见的正文增量。
@@ -529,6 +534,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		group.POST("/responses", h.Responses)
 		// 兼容部分客户端将 compact 请求打到 /responses/compact。
 		group.POST("/responses/compact", h.Responses)
+		group.POST("/images/generations", h.ImagesGenerations)
+		group.POST("/images/edits", h.ImagesEdits)
 		group.GET("/models", h.ListModels)
 	}
 
@@ -736,7 +743,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRules()
-	rules["model"] = append(rules["model"], api.ModelValidator(SupportedModels))
+	rules["model"] = append(rules["model"], api.ModelValidator(ListPublicModels()))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -764,6 +771,14 @@ func (h *Handler) Responses(c *gin.Context) {
 
 	if model == "" {
 		api.SendMissingFieldError(c, "model")
+		return
+	}
+	if IsImageOnlyModel(model) {
+		api.SendError(c, api.NewAPIError(
+			api.ErrCodeUnsupportedModel,
+			fmt.Sprintf("model '%s' is only supported on /v1/images/generations and /v1/images/edits", model),
+			api.ErrorTypeInvalidRequest,
+		))
 		return
 	}
 
@@ -797,7 +812,8 @@ func (h *Handler) Responses(c *gin.Context) {
 	if re := gjson.GetBytes(codexBody, "reasoning_effort"); re.Exists() && !gjson.GetBytes(codexBody, "reasoning.effort").Exists() {
 		codexBody, _ = sjson.SetBytes(codexBody, "reasoning.effort", re.String())
 	}
-	codexBody = clampReasoningEffort(codexBody)
+	codexBody = clampReasoningEffort(codexBody, model)
+	reasoningEffort = gjson.GetBytes(codexBody, "reasoning.effort").String()
 	codexBody = sanitizeServiceTierForUpstream(codexBody)
 
 	// 为缺少 description 的客户端执行工具补充默认描述（如 tool_search）
@@ -1091,7 +1107,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					cacheCompletedResponse([]byte(expandedInputRaw), data)
 					gotTerminal = true
 					lastResponseData = data
-					return false
+					return true
 				}
 				if eventType == "response.failed" {
 					gotTerminal = true
@@ -1225,7 +1241,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ChatCompletionValidationRules()
-	rules["model"] = append(rules["model"], api.ModelValidator(SupportedModels))
+	rules["model"] = append(rules["model"], api.ModelValidator(ListPublicModels()))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -1244,6 +1260,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	if model == "" {
 		model = "gpt-5.4"
 	}
+	if IsImageOnlyModel(model) {
+		api.SendError(c, api.NewAPIError(
+			api.ErrCodeUnsupportedModel,
+			fmt.Sprintf("model '%s' is only supported on /v1/images/generations and /v1/images/edits", model),
+			api.ErrorTypeInvalidRequest,
+		))
+		return
+	}
 	requestStartedAt := requestStartTime(c)
 
 	// 验证 model 参数
@@ -1255,6 +1279,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
+	includeUsage := extractStreamIncludeUsage(rawBody)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
@@ -1268,6 +1293,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Request translation failed: "+err.Error(), api.ErrorTypeInvalidRequest))
 		return
 	}
+	reasoningEffort = gjson.GetBytes(codexBody, "reasoning.effort").String()
 
 	sessionID := ResolveSessionID(c.GetHeader("Authorization"), codexBody)
 
@@ -1414,13 +1440,16 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		wroteAnyBytes := false
 		wroteVisibleBody := false
 		pendingFrames := make([]string, 0, 8)
+		var streamTranslator *StreamTranslator
+		var streamFlusher http.Flusher
+		streamDoneSent := false
 		var compactResult []byte
 
 		chunkID := "chatcmpl-" + uuid.New().String()[:8]
 		created := time.Now().Unix()
 
 		if isStream {
-			streamTranslator := NewStreamTranslator(chunkID, model)
+			streamTranslator = NewStreamTranslator(chunkID, model, includeUsage)
 			c.Header("Content-Type", "text/event-stream")
 			c.Header("Cache-Control", "no-cache")
 			c.Header("Connection", "keep-alive")
@@ -1435,6 +1464,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.store.Release(account)
 				return
 			}
+			streamFlusher = flusher
 			// 先发一个 SSE 注释帧，避免前置代理/网关等待首包超时（如 524）。
 			if _, err := fmt.Fprint(c.Writer, ": keep-alive\n\n"); err != nil {
 				c.JSON(http.StatusBadGateway, gin.H{
@@ -1529,12 +1559,42 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 						writeErr = err
 						return false
 					}
+					streamDoneSent = true
 					wroteAnyBytes = true
 					flusher.Flush()
 					return false
 				}
 				return true
 			})
+			if !streamDoneSent && writeErr == nil && streamTranslator != nil {
+				// 若上游先发 completed 再晚到 usage，Translate 不会立即 done，这里统一收口补发最终块。
+				if len(pendingFrames) > 0 {
+					for _, pending := range pendingFrames {
+						if _, err := fmt.Fprint(c.Writer, pending); err != nil {
+							writeErr = err
+							break
+						}
+					}
+					pendingFrames = pendingFrames[:0]
+				}
+				if writeErr == nil {
+					if finalChunk, ok := streamTranslator.Finalize(); ok && finalChunk != nil {
+						finalChunk, _ = sjson.SetBytes(finalChunk, "created", created)
+						if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", finalChunk); err != nil {
+							writeErr = err
+						} else if _, err := fmt.Fprint(c.Writer, "data: [DONE]\n\n"); err != nil {
+							writeErr = err
+						} else {
+							streamDoneSent = true
+							wroteAnyBytes = true
+							gotTerminal = true
+							if streamFlusher != nil {
+								streamFlusher.Flush()
+							}
+						}
+					}
+				}
+			}
 		} else {
 			var fullContent strings.Builder
 			var toolCalls []ToolCallResult
@@ -1568,7 +1628,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					toolCalls = ExtractToolCallsFromOutput(data)
 					lastResponseData = data
 					gotTerminal = true
-					return false
+					return true
 				case "response.failed":
 					gotTerminal = true
 					return false
@@ -2105,18 +2165,12 @@ func (h *Handler) handleUpstreamError(c *gin.Context, account *auth.Account, sta
 	h.sendUpstreamError(c, statusCode, body)
 }
 
-// SupportedModels 支持的模型列表（全局共享）
-var SupportedModels = []string{
-	"gpt-5.4", "gpt-5.4-mini", "gpt-5", "gpt-5-codex", "gpt-5-codex-mini",
-	"gpt-5.1", "gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5.1-codex-max",
-	"gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex",
-}
-
 // ListModels 列出可用模型
 func (h *Handler) ListModels(c *gin.Context) {
-	models := make([]api.Model, 0, len(SupportedModels))
+	visibleModels := ListPublicModels()
+	models := make([]api.Model, 0, len(visibleModels))
 	now := time.Now().Unix()
-	for _, id := range SupportedModels {
+	for _, id := range visibleModels {
 		models = append(models, api.Model{
 			ID:      id,
 			Object:  "model",

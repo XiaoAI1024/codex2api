@@ -14,6 +14,7 @@ import (
 // TranslateRequest 将 OpenAI Chat Completions 请求转换为 Codex Responses 格式
 func TranslateRequest(rawJSON []byte) ([]byte, error) {
 	result := rawJSON
+	model := gjson.GetBytes(result, "model").String()
 
 	// 1. 转换 messages → input
 	messages := gjson.GetBytes(result, "messages")
@@ -31,7 +32,7 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 	if re := gjson.GetBytes(result, "reasoning_effort"); re.Exists() && !gjson.GetBytes(result, "reasoning.effort").Exists() {
 		result, _ = sjson.SetBytes(result, "reasoning.effort", re.String())
 	}
-	result = clampReasoningEffort(result)
+	result = clampReasoningEffort(result, model)
 
 	// 4. 统一 service tier 字段命名，保留给上游用于 fast 调度
 	result = normalizeServiceTierField(result)
@@ -67,21 +68,22 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 	return result, nil
 }
 
-// clampReasoningEffort 将 reasoning.effort 钳位到上游支持的值（low/medium/high/xhigh）
-// 不支持的值映射到最接近的合法值
-func clampReasoningEffort(body []byte) []byte {
+// clampReasoningEffort 将 reasoning.effort 按模型能力钳位。
+// - 模型不支持 reasoning：删除 reasoning 字段
+// - 模型支持但值非法：降级到该模型上限档位
+func clampReasoningEffort(body []byte, model string) []byte {
 	effort := gjson.GetBytes(body, "reasoning.effort").String()
-	if effort == "" {
+	clampedEffort, keep := ClampReasoningEffortForModel(model, effort)
+	if !keep {
+		body, _ = sjson.DeleteBytes(body, "reasoning")
+		body, _ = sjson.DeleteBytes(body, "reasoning_effort")
 		return body
 	}
-	switch strings.ToLower(effort) {
-	case "low", "medium", "high", "xhigh":
-		return body // 合法值，不修改
-	default:
-		// very_high 等超出范围的值 → 钳位到 high
-		body, _ = sjson.SetBytes(body, "reasoning.effort", "high")
+	if effort == "" || clampedEffort == "" {
 		return body
 	}
+	body, _ = sjson.SetBytes(body, "reasoning.effort", clampedEffort)
+	return body
 }
 
 func normalizeServiceTierField(body []byte) []byte {
@@ -462,16 +464,37 @@ type UsageInfo struct {
 func extractUsage(eventData []byte) *UsageInfo {
 	usage := gjson.GetBytes(eventData, "response.usage")
 	if !usage.Exists() {
+		usage = gjson.GetBytes(eventData, "usage")
+	}
+	if !usage.Exists() {
 		return nil
 	}
+
 	inputTokens := int(usage.Get("input_tokens").Int())
+	if inputTokens == 0 {
+		inputTokens = int(usage.Get("prompt_tokens").Int())
+	}
 	outputTokens := int(usage.Get("output_tokens").Int())
+	if outputTokens == 0 {
+		outputTokens = int(usage.Get("completion_tokens").Int())
+	}
+	totalTokens := int(usage.Get("total_tokens").Int())
+	if totalTokens == 0 {
+		totalTokens = inputTokens + outputTokens
+	}
 	reasoningTokens := int(usage.Get("output_tokens_details.reasoning_tokens").Int())
+	if reasoningTokens == 0 {
+		reasoningTokens = int(usage.Get("completion_tokens_details.reasoning_tokens").Int())
+	}
 	cachedTokens := int(usage.Get("input_tokens_details.cached_tokens").Int())
+	if cachedTokens == 0 {
+		cachedTokens = int(usage.Get("prompt_tokens_details.cached_tokens").Int())
+	}
+
 	return &UsageInfo{
 		PromptTokens:     inputTokens,
 		CompletionTokens: outputTokens,
-		TotalTokens:      inputTokens + outputTokens,
+		TotalTokens:      totalTokens,
 		InputTokens:      inputTokens,
 		OutputTokens:     outputTokens,
 		ReasoningTokens:  reasoningTokens,
@@ -564,9 +587,6 @@ func TranslateCompactResponse(responseData []byte, model string, id string) []by
 
 	// 提取 usage
 	usage := extractUsage(responseData)
-	if usage == nil {
-		usage = gjson.GetBytes(responseData, "usage").Value().(*UsageInfo)
-	}
 	if usage != nil {
 		result, _ = sjson.SetBytes(result, "usage.prompt_tokens", usage.PromptTokens)
 		result, _ = sjson.SetBytes(result, "usage.completion_tokens", usage.CompletionTokens)
@@ -590,21 +610,42 @@ type StreamTranslator struct {
 	Model        string
 	ChunkID      string
 	HasToolCalls bool
+	IncludeUsage bool
 	toolCallMap  map[string]int // Codex item.id → OpenAI tool_calls index
 	nextIdx      int
+	usage        *UsageInfo
+	pendingDone  bool
+	doneSent     bool
 }
 
 // NewStreamTranslator 创建流式翻译器实例
-func NewStreamTranslator(chunkID, model string) *StreamTranslator {
+func NewStreamTranslator(chunkID, model string, includeUsage ...bool) *StreamTranslator {
+	wantUsage := true
+	if len(includeUsage) > 0 {
+		wantUsage = includeUsage[0]
+	}
 	return &StreamTranslator{
-		Model:       model,
-		ChunkID:     chunkID,
-		toolCallMap: make(map[string]int),
+		Model:        model,
+		ChunkID:      chunkID,
+		IncludeUsage: wantUsage,
+		toolCallMap:  make(map[string]int),
 	}
 }
 
 // Translate 将单个 Codex SSE 事件翻译为 OpenAI Chat Completions 流式格式
 func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
+	if st.doneSent {
+		return nil, false
+	}
+
+	if usage := extractUsage(eventData); usage != nil {
+		st.usage = usage
+	}
+
+	if st.pendingDone && st.IncludeUsage && st.usage != nil && !st.doneSent {
+		return st.finalizeLocked()
+	}
+
 	eventType := gjson.GetBytes(eventData, "type").String()
 
 	switch eventType {
@@ -653,19 +694,27 @@ func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
 		return nil, false
 
 	case "response.completed":
-		usage := extractUsage(eventData)
-		finishReason := "stop"
-		if st.HasToolCalls {
-			finishReason = "tool_calls"
+		if !st.HasToolCalls {
+			if len(ExtractToolCallsFromOutput(eventData)) > 0 {
+				st.HasToolCalls = true
+			}
 		}
-		chunk := buildOpenAIFinalChunkWithReason(st.ChunkID, st.Model, usage, finishReason)
-		return chunk, true
+		if st.pendingDone {
+			if !st.IncludeUsage || st.usage != nil {
+				return st.finalizeLocked()
+			}
+			return nil, false
+		}
+		st.pendingDone = true
+		// 首个 completed 不立即结束，等待晚到 usage 或流结束收口。
+		return nil, false
 
 	case "response.failed":
 		errMsg := gjson.GetBytes(eventData, "response.error.message").String()
 		if errMsg == "" {
 			errMsg = "Codex upstream error"
 		}
+		st.doneSent = true
 		return buildOpenAIError(errMsg), true
 
 	case "response.created", "response.in_progress",
@@ -681,6 +730,36 @@ func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
 		}
 		return nil, false
 	}
+}
+
+// Finalize 在上游流结束时执行收口，必要时补发最终块。
+func (st *StreamTranslator) Finalize() ([]byte, bool) {
+	if !st.pendingDone || st.doneSent {
+		return nil, false
+	}
+	return st.finalizeLocked()
+}
+
+// Flush 是 Finalize 的兼容别名。
+func (st *StreamTranslator) Flush() ([]byte, bool) {
+	return st.Finalize()
+}
+
+func (st *StreamTranslator) finalizeLocked() ([]byte, bool) {
+	if st.doneSent {
+		return nil, false
+	}
+	finishReason := "stop"
+	if st.HasToolCalls {
+		finishReason = "tool_calls"
+	}
+	usage := st.usage
+	if !st.IncludeUsage {
+		usage = nil
+	}
+	chunk := buildOpenAIFinalChunkWithReason(st.ChunkID, st.Model, usage, finishReason)
+	st.doneSent = true
+	return chunk, true
 }
 
 // buildOpenAIToolCallChunk 构建 tool call 首块（含 id、type、function.name）
