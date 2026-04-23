@@ -62,3 +62,29 @@ func TestClampReasoningEffortForModel(t *testing.T) {
 		t.Fatalf("expected empty effort, got %q", effort)
 	}
 }
+
+func TestClampReasoningEffortForModel_UnknownAndNormalization(t *testing.T) {
+	effort, keep := ClampReasoningEffortForModel("unknown-model", "high")
+	if keep {
+		t.Fatal("unknown model should drop reasoning field")
+	}
+	if effort != "" {
+		t.Fatalf("unknown model effort should be empty, got %q", effort)
+	}
+
+	effort, keep = ClampReasoningEffortForModel(" GPT-5.4-MINI ", " HIGH ")
+	if !keep {
+		t.Fatal("known model should keep reasoning field")
+	}
+	if effort != "high" {
+		t.Fatalf("expected normalized effort high, got %q", effort)
+	}
+
+	effort, keep = ClampReasoningEffortForModel("gpt-5.4-mini", "")
+	if !keep {
+		t.Fatal("empty effort on known model should still keep reasoning field")
+	}
+	if effort != "" {
+		t.Fatalf("empty effort should remain empty, got %q", effort)
+	}
+}

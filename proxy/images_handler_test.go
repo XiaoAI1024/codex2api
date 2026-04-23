@@ -84,3 +84,143 @@ func TestExtractImagesFromResponsesCompleted(t *testing.T) {
 		t.Fatalf("usage raw missing total_images: %s", string(usageRaw))
 	}
 }
+
+func TestNormalizeImageInput(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "http url", in: "http://example.com/a.png", want: "http://example.com/a.png"},
+		{name: "https url", in: "https://example.com/a.png", want: "https://example.com/a.png"},
+		{name: "data uri", in: "data:image/jpeg;base64,AAA", want: "data:image/jpeg;base64,AAA"},
+		{name: "raw base64", in: "AAA", want: "data:image/png;base64,AAA"},
+		{name: "trim spaces", in: "  BBB  ", want: "data:image/png;base64,BBB"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := normalizeImageInput(tc.in); got != tc.want {
+				t.Fatalf("normalizeImageInput(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCollectCompletedImageEvent_LateCompletedWins(t *testing.T) {
+	stream := strings.NewReader(strings.Join([]string{
+		`data: {"type":"response.completed","response":{"output":[{"type":"image_generation_call","result":"OLD"}]}}`,
+		"",
+		`data: {"type":"response.completed","response":{"output":[{"type":"image_generation_call","result":"NEW"}],"tool_usage":{"image_gen":{"total_images":1}}}}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n"))
+
+	completed, failed, err := collectCompletedImageEvent(stream)
+	if err != nil {
+		t.Fatalf("collectCompletedImageEvent failed: %v", err)
+	}
+	if failed != "" {
+		t.Fatalf("failed message should be empty, got %q", failed)
+	}
+	if got := gjson.GetBytes(completed, "response.output.0.result").String(); got != "NEW" {
+		t.Fatalf("latest completed result = %q, want %q", got, "NEW")
+	}
+	if got := gjson.GetBytes(completed, "response.tool_usage.image_gen.total_images").Int(); got != 1 {
+		t.Fatalf("tool_usage.total_images = %d, want 1", got)
+	}
+}
+
+func TestCollectCompletedImageEvent_FailedMessage(t *testing.T) {
+	stream := strings.NewReader("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\n")
+
+	completed, failed, err := collectCompletedImageEvent(stream)
+	if err != nil {
+		t.Fatalf("collectCompletedImageEvent failed: %v", err)
+	}
+	if completed != nil {
+		t.Fatalf("completed should be nil on failure, got %s", string(completed))
+	}
+	if failed != "boom" {
+		t.Fatalf("failed = %q, want %q", failed, "boom")
+	}
+}
+
+func TestBuildImagesAPIResponse_URLAndUsage(t *testing.T) {
+	results := []imageCallResult{
+		{
+			Result:        "AAAA",
+			RevisedPrompt: "cat",
+			OutputFormat:  "webp",
+			Size:          "1024x1024",
+			Background:    "transparent",
+			Quality:       "high",
+		},
+	}
+	payload, err := buildImagesAPIResponse(results, 1710000000, []byte(`{"total_images":1}`), results[0], "url")
+	if err != nil {
+		t.Fatalf("buildImagesAPIResponse failed: %v", err)
+	}
+
+	if got := gjson.GetBytes(payload, "created").Int(); got != 1710000000 {
+		t.Fatalf("created = %d, want 1710000000", got)
+	}
+	if got := gjson.GetBytes(payload, "data.0.url").String(); got != "data:image/webp;base64,AAAA" {
+		t.Fatalf("url = %q, want data:image/webp;base64,AAAA", got)
+	}
+	if got := gjson.GetBytes(payload, "data.0.revised_prompt").String(); got != "cat" {
+		t.Fatalf("revised_prompt = %q, want %q", got, "cat")
+	}
+	if got := gjson.GetBytes(payload, "background").String(); got != "transparent" {
+		t.Fatalf("background = %q, want %q", got, "transparent")
+	}
+	if got := gjson.GetBytes(payload, "usage.total_images").Int(); got != 1 {
+		t.Fatalf("usage.total_images = %d, want 1", got)
+	}
+}
+
+func TestBuildImagesAPIResponse_InvalidUsageIgnored(t *testing.T) {
+	results := []imageCallResult{{Result: "AAAA"}}
+	payload, err := buildImagesAPIResponse(results, 1710000000, []byte(`{"total_images":`), imageCallResult{}, "b64_json")
+	if err != nil {
+		t.Fatalf("buildImagesAPIResponse failed: %v", err)
+	}
+
+	if got := gjson.GetBytes(payload, "data.0.b64_json").String(); got != "AAAA" {
+		t.Fatalf("b64_json = %q, want %q", got, "AAAA")
+	}
+	if gjson.GetBytes(payload, "usage").Exists() {
+		t.Fatalf("usage should be omitted for invalid usage raw: %s", string(payload))
+	}
+}
+
+func TestExtractImagesFromResponsesCompleted_ErrorPaths(t *testing.T) {
+	if _, _, _, _, err := extractImagesFromResponsesCompleted([]byte(`{"type":"response.failed"}`)); err == nil {
+		t.Fatal("unexpected event type should return error")
+	}
+
+	payloadNoImage := []byte(`{
+		"type":"response.completed",
+		"response":{"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}
+	}`)
+	if _, _, _, _, err := extractImagesFromResponsesCompleted(payloadNoImage); err == nil {
+		t.Fatal("missing image_generation_call should return error")
+	}
+}
+
+func TestMimeTypeFromOutputFormat(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{in: "", want: "image/png"},
+		{in: "jpeg", want: "image/jpeg"},
+		{in: "image/webp", want: "image/webp"},
+		{in: "unknown", want: "image/png"},
+	}
+	for _, tc := range tests {
+		if got := mimeTypeFromOutputFormat(tc.in); got != tc.want {
+			t.Fatalf("mimeTypeFromOutputFormat(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

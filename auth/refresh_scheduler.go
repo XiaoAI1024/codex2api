@@ -15,61 +15,61 @@ import (
 type RefreshState int
 
 const (
-	RefreshStatePending   RefreshState = iota // 等待执行
-	RefreshStateRunning                       // 执行中
-	RefreshStateSuccess                       // 成功
-	RefreshStateFailed                        // 失败
-	RefreshStateRetrying                      // 重试中
+	RefreshStatePending  RefreshState = iota // 等待执行
+	RefreshStateRunning                      // 执行中
+	RefreshStateSuccess                      // 成功
+	RefreshStateFailed                       // 失败
+	RefreshStateRetrying                     // 重试中
 )
 
 // RefreshTask 刷新任务
 type RefreshTask struct {
 	Account     *Account
-	ScheduledAt time.Time      // 计划执行时间
-	Priority    int            // 优先级（数值越大优先级越高）
-	Attempts    int            // 已尝试次数
-	State       RefreshState   // 当前状态
-	LastError   error          // 上次错误
-	NextRetryAt time.Time      // 下次重试时间
-	mu          sync.RWMutex   // 任务级锁
-	heapIndex   int            // 在堆中的索引，用于 heap.Remove
+	ScheduledAt time.Time    // 计划执行时间
+	Priority    int          // 优先级（数值越大优先级越高）
+	Attempts    int          // 已尝试次数
+	State       RefreshState // 当前状态
+	LastError   error        // 上次错误
+	NextRetryAt time.Time    // 下次重试时间
+	mu          sync.RWMutex // 任务级锁
+	heapIndex   int          // 在堆中的索引，用于 heap.Remove
 }
 
 // RefreshMetrics 刷新指标（用于监控）
 type RefreshMetrics struct {
-	TotalTasks      atomic.Int64 // 总任务数
-	PendingTasks    atomic.Int64 // 等待任务数
-	RunningTasks    atomic.Int64 // 运行中任务数
-	SuccessCount    atomic.Int64 // 成功次数
-	FailedCount     atomic.Int64 // 失败次数
-	RetryCount      atomic.Int64 // 重试次数
-	AvgDurationMs   atomic.Int64 // 平均耗时（毫秒）
-	LastRefreshAt   atomic.Int64 // 上次刷新时间戳
+	TotalTasks    atomic.Int64 // 总任务数
+	PendingTasks  atomic.Int64 // 等待任务数
+	RunningTasks  atomic.Int64 // 运行中任务数
+	SuccessCount  atomic.Int64 // 成功次数
+	FailedCount   atomic.Int64 // 失败次数
+	RetryCount    atomic.Int64 // 重试次数
+	AvgDurationMs atomic.Int64 // 平均耗时（毫秒）
+	LastRefreshAt atomic.Int64 // 上次刷新时间戳
 }
 
 // RefreshConfig 刷新调度器配置
 type RefreshConfig struct {
-	MaxConcurrency     int           // 最大并发刷新数
-	MinInterval        time.Duration // 最小刷新间隔（避免刷新风暴）
-	PreExpireWindow    time.Duration // 提前刷新窗口（过期前多久开始刷新）
-	RetryBackoffBase   time.Duration // 重试退避基数
-	RetryMaxAttempts   int           // 最大重试次数
-	JitterPercent      float64       // 抖动百分比（0-1）
-	EnableBatchOptimize bool         // 启用批量优化
-	BatchSize          int           // 批量大小
+	MaxConcurrency      int           // 最大并发刷新数
+	MinInterval         time.Duration // 最小刷新间隔（避免刷新风暴）
+	PreExpireWindow     time.Duration // 提前刷新窗口（过期前多久开始刷新）
+	RetryBackoffBase    time.Duration // 重试退避基数
+	RetryMaxAttempts    int           // 最大重试次数
+	JitterPercent       float64       // 抖动百分比（0-1）
+	EnableBatchOptimize bool          // 启用批量优化
+	BatchSize           int           // 批量大小
 }
 
 // DefaultRefreshConfig 返回默认配置
 func DefaultRefreshConfig() RefreshConfig {
 	return RefreshConfig{
-		MaxConcurrency:     10,
-		MinInterval:        100 * time.Millisecond,
-		PreExpireWindow:    5 * time.Minute,
-		RetryBackoffBase:   1 * time.Second,
-		RetryMaxAttempts:   3,
-		JitterPercent:      0.1,
+		MaxConcurrency:      10,
+		MinInterval:         100 * time.Millisecond,
+		PreExpireWindow:     5 * time.Minute,
+		RetryBackoffBase:    1 * time.Second,
+		RetryMaxAttempts:    3,
+		JitterPercent:       0.1,
 		EnableBatchOptimize: true,
-		BatchSize:          5,
+		BatchSize:           5,
 	}
 }
 
@@ -83,8 +83,41 @@ func (pq taskPriorityQueue) Less(i, j int) bool {
 	if pq[i].Priority != pq[j].Priority {
 		return pq[i].Priority > pq[j].Priority
 	}
-	// 优先级相同，按计划时间排序
-	return pq[i].ScheduledAt.Before(pq[j].ScheduledAt)
+	// 优先级相同，优先处理更早过期的账号，避免随机抖动导致顺序不稳定。
+	// 当 ExpiresAt 无效或相同，再退化为 ScheduledAt / DBID 以保持堆序确定性。
+	expiresI := pq[i].accountExpiresAt()
+	expiresJ := pq[j].accountExpiresAt()
+	if !expiresI.Equal(expiresJ) {
+		if expiresI.IsZero() {
+			return false
+		}
+		if expiresJ.IsZero() {
+			return true
+		}
+		return expiresI.Before(expiresJ)
+	}
+
+	if !pq[i].ScheduledAt.Equal(pq[j].ScheduledAt) {
+		return pq[i].ScheduledAt.Before(pq[j].ScheduledAt)
+	}
+
+	if pq[i].Account == nil {
+		return false
+	}
+	if pq[j].Account == nil {
+		return true
+	}
+	return pq[i].Account.DBID < pq[j].Account.DBID
+}
+
+func (t *RefreshTask) accountExpiresAt() time.Time {
+	if t == nil || t.Account == nil {
+		return time.Time{}
+	}
+	t.Account.mu.RLock()
+	expiresAt := t.Account.ExpiresAt
+	t.Account.mu.RUnlock()
+	return expiresAt
 }
 
 func (pq taskPriorityQueue) Swap(i, j int) {
@@ -111,20 +144,20 @@ func (pq *taskPriorityQueue) Pop() interface{} {
 
 // RefreshScheduler 智能刷新调度器
 type RefreshScheduler struct {
-	config     RefreshConfig
-	store      *Store
-	queue      chan *RefreshTask
-	semaphore  chan struct{}
-	pq         *taskPriorityQueue
-	pqMu       sync.Mutex
-	tasks      map[int64]*RefreshTask // dbID -> task
-	tasksMu    sync.RWMutex
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	metrics    *RefreshMetrics
-	lastBatch  time.Time
-	batchMu    sync.Mutex
+	config    RefreshConfig
+	store     *Store
+	queue     chan *RefreshTask
+	semaphore chan struct{}
+	pq        *taskPriorityQueue
+	pqMu      sync.Mutex
+	tasks     map[int64]*RefreshTask // dbID -> task
+	tasksMu   sync.RWMutex
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	metrics   *RefreshMetrics
+	lastBatch time.Time
+	batchMu   sync.Mutex
 }
 
 // NewRefreshScheduler 创建刷新调度器

@@ -415,3 +415,82 @@ func TestExtractToolCallsFromOutput(t *testing.T) {
 		t.Fatalf("second tool call mismatch: %+v", tcs[1])
 	}
 }
+
+func TestStreamTranslator_IncludeUsageTrueFinalizeWithoutUsage(t *testing.T) {
+	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", true)
+
+	completedEvent := []byte(`{"type":"response.completed","response":{"output":[]}}`)
+	chunk, done := st.Translate(completedEvent)
+	if done || chunk != nil {
+		t.Fatal("first completed should only mark pending done")
+	}
+
+	// 重复 completed 且仍无 usage，不应提前结束
+	chunk, done = st.Translate(completedEvent)
+	if done || chunk != nil {
+		t.Fatal("repeated completed without usage should keep waiting for finalize")
+	}
+
+	chunk, done = st.Finalize()
+	if !done || chunk == nil {
+		t.Fatal("Finalize should emit final chunk once when stream closes")
+	}
+	if gjson.GetBytes(chunk, "usage").Exists() {
+		t.Fatal("usage should be omitted when upstream never returns usage")
+	}
+}
+
+func TestExtractUsage_FallbackFields(t *testing.T) {
+	event := []byte(`{
+		"type":"response.completed",
+		"response":{
+			"usage":{
+				"prompt_tokens":3,
+				"completion_tokens":2,
+				"prompt_tokens_details":{"cached_tokens":1},
+				"completion_tokens_details":{"reasoning_tokens":4}
+			}
+		}
+	}`)
+
+	usage := extractUsage(event)
+	if usage == nil {
+		t.Fatal("extractUsage should return usage")
+	}
+	if usage.PromptTokens != 3 || usage.InputTokens != 3 {
+		t.Fatalf("prompt/input tokens mismatch: %+v", usage)
+	}
+	if usage.CompletionTokens != 2 || usage.OutputTokens != 2 {
+		t.Fatalf("completion/output tokens mismatch: %+v", usage)
+	}
+	if usage.TotalTokens != 5 {
+		t.Fatalf("total_tokens = %d, want 5", usage.TotalTokens)
+	}
+	if usage.CachedTokens != 1 {
+		t.Fatalf("cached_tokens = %d, want 1", usage.CachedTokens)
+	}
+	if usage.ReasoningTokens != 4 {
+		t.Fatalf("reasoning_tokens = %d, want 4", usage.ReasoningTokens)
+	}
+}
+
+func TestClampReasoningEffort_DropsForUnsupportedModel(t *testing.T) {
+	raw := []byte(`{"reasoning":{"effort":"high"},"reasoning_effort":"high"}`)
+	got := clampReasoningEffort(raw, "gpt-image-2")
+
+	if gjson.GetBytes(got, "reasoning").Exists() {
+		t.Fatalf("reasoning should be removed for image-only model: %s", string(got))
+	}
+	if gjson.GetBytes(got, "reasoning_effort").Exists() {
+		t.Fatalf("reasoning_effort should be removed for image-only model: %s", string(got))
+	}
+}
+
+func TestClampReasoningEffort_ClampsToModelMax(t *testing.T) {
+	raw := []byte(`{"reasoning":{"effort":"xhigh"}}`)
+	got := clampReasoningEffort(raw, "gpt-5.1-codex-mini")
+
+	if effort := gjson.GetBytes(got, "reasoning.effort").String(); effort != "medium" {
+		t.Fatalf("reasoning.effort = %q, want %q", effort, "medium")
+	}
+}

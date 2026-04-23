@@ -222,3 +222,15 @@ func TestEnsureResponseOutputFromDelta_KeepsExistingOutput(t *testing.T) {
 		t.Fatalf("expected unchanged payload, got %s", string(patched))
 	}
 }
+
+func TestExtractStreamIncludeUsage(t *testing.T) {
+	if !extractStreamIncludeUsage([]byte(`{"stream_options":{"include_usage":true}}`)) {
+		t.Fatal("include_usage=true should be extracted as true")
+	}
+	if extractStreamIncludeUsage([]byte(`{"stream_options":{"include_usage":false}}`)) {
+		t.Fatal("include_usage=false should be extracted as false")
+	}
+	if extractStreamIncludeUsage([]byte(`{"stream":true}`)) {
+		t.Fatal("missing include_usage should default to false")
+	}
+}

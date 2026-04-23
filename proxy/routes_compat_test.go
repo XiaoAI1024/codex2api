@@ -29,11 +29,10 @@ func TestRegisterRoutes_OpenAICompatibilityPaths(t *testing.T) {
 		{method: http.MethodPost, path: "/responses", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
 		{method: http.MethodPost, path: "/v1/responses/compact", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
 		{method: http.MethodPost, path: "/responses/compact", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
-		// Images 路由尚未注册时允许 404；注册后会进入鉴权返回 401。
-		{method: http.MethodPost, path: "/v1/images/generations", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}, http.StatusNotFound: {}}},
-		{method: http.MethodPost, path: "/images/generations", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}, http.StatusNotFound: {}}},
-		{method: http.MethodPost, path: "/v1/images/edits", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}, http.StatusNotFound: {}}},
-		{method: http.MethodPost, path: "/images/edits", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}, http.StatusNotFound: {}}},
+		{method: http.MethodPost, path: "/v1/images/generations", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
+		{method: http.MethodPost, path: "/images/generations", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
+		{method: http.MethodPost, path: "/v1/images/edits", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
+		{method: http.MethodPost, path: "/images/edits", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
 		{method: http.MethodGet, path: "/v1/models", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
 		{method: http.MethodGet, path: "/models", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
 	}
