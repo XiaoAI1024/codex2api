@@ -645,7 +645,7 @@ func (h *Handler) forceDeleteAccount(accountID int64, source string) {
 	}
 	if h.db != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		_ = h.db.SetError(ctx, accountID, "deleted")
+		_ = h.db.DeleteAccountHard(ctx, accountID)
 		cancel()
 		h.db.InsertAccountEventAsync(accountID, "deleted", source)
 	}
@@ -712,7 +712,7 @@ func (h *Handler) applyUnauthorizedCooldown(account *auth.Account, upstreamStatu
 		log.Printf("账号 %d 收到封禁类错误(上游 %d/%s)，立即清理", account.ID(), upstreamStatusCode, errCode)
 		if h.db != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			_ = h.db.SetError(ctx, account.ID(), "deleted")
+			_ = h.db.DeleteAccountHard(ctx, account.ID())
 			cancel()
 			h.db.InsertAccountEventAsync(account.ID(), "deleted", "auto_clean_unauthorized")
 		}

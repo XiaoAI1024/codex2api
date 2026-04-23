@@ -1453,8 +1453,8 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	// 标记为 deleted 而非物理删除
-	if err := h.db.SetError(ctx, id, "deleted"); err != nil {
+	// 物理删除，避免 deleted 历史账号持续累积
+	if err := h.db.DeleteAccountHard(ctx, id); err != nil {
 		writeError(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}
@@ -2458,6 +2458,10 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 	var entries []cpaExportEntry
 	for _, row := range rows {
 		if idSet != nil && !idSet[row.ID] {
+			continue
+		}
+		// 兼容历史软删除数据：all 导出也跳过 deleted 账号
+		if strings.EqualFold(strings.TrimSpace(row.ErrorMessage), "deleted") {
 			continue
 		}
 		if filter == "healthy" {

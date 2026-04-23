@@ -1974,6 +1974,80 @@ func (db *DB) SetError(ctx context.Context, id int64, errorMsg string) error {
 	return err
 }
 
+// DeleteAccountHard 物理删除账号（并清理结算绑定）
+func (db *DB) DeleteAccountHard(ctx context.Context, id int64) error {
+	if id == 0 {
+		return nil
+	}
+
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM public_account_settlements WHERE account_id = $1`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM accounts WHERE id = $1`, id); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// BatchDeleteAccountsHard 批量物理删除账号（并清理结算绑定）
+func (db *DB) BatchDeleteAccountsHard(ctx context.Context, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	const batchSize = 500
+	for i := 0; i < len(ids); i += batchSize {
+		end := i + batchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[i:end]
+
+		placeholders := make([]string, len(batch))
+		args := make([]interface{}, 0, len(batch))
+		for j, id := range batch {
+			placeholders[j] = fmt.Sprintf("$%d", j+1)
+			args = append(args, id)
+		}
+
+		tx, err := db.conn.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("batch %d-%d begin tx failed: %w", i, end, err)
+		}
+
+		deleteSettlements := fmt.Sprintf(
+			`DELETE FROM public_account_settlements WHERE account_id IN (%s)`,
+			strings.Join(placeholders, ","),
+		)
+		if _, err := tx.ExecContext(ctx, deleteSettlements, args...); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("batch %d-%d delete settlements failed: %w", i, end, err)
+		}
+
+		deleteAccounts := fmt.Sprintf(
+			`DELETE FROM accounts WHERE id IN (%s)`,
+			strings.Join(placeholders, ","),
+		)
+		if _, err := tx.ExecContext(ctx, deleteAccounts, args...); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("batch %d-%d delete accounts failed: %w", i, end, err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("batch %d-%d commit failed: %w", i, end, err)
+		}
+	}
+
+	return nil
+}
+
 // BatchSetError 批量标记账号错误状态，分批执行避免 SQL 参数过多
 func (db *DB) BatchSetError(ctx context.Context, ids []int64, errorMsg string) error {
 	const batchSize = 500

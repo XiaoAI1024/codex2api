@@ -292,7 +292,7 @@ func (h *Handler) DeleteAuthFilesCompat(c *gin.Context) {
 
 	deleted := 0
 	for id := range idsToDelete {
-		if err := h.db.SetError(ctx, id, "deleted"); err != nil {
+		if err := h.db.DeleteAccountHard(ctx, id); err != nil {
 			log.Printf("删除账号 %d 失败: %v", id, err)
 			continue
 		}
@@ -679,7 +679,7 @@ func (h *Handler) insertCompatAccount(ctx context.Context, name string, entry co
 		validateCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 		defer cancel()
 		if err := h.validatePublicUploadedAccount(validateCtx, id); err != nil {
-			_ = h.db.SetError(context.Background(), id, "deleted")
+			_ = h.db.DeleteAccountHard(context.Background(), id)
 			h.store.RemoveAccount(id)
 			h.db.InsertAccountEventAsync(id, "upload_invalid", "cliproxy")
 			return 0, fmt.Errorf("上传后测试失败，账号无效: %w", err)
@@ -698,7 +698,7 @@ func (h *Handler) insertCompatAccount(ctx context.Context, name string, entry co
 			InitialAmountUSD:     initialCredit,
 			FullAmountUSD:        fullCredit,
 		}); err != nil {
-			_ = h.db.SetError(context.Background(), id, "deleted")
+			_ = h.db.DeleteAccountHard(context.Background(), id)
 			h.store.RemoveAccount(id)
 			return 0, fmt.Errorf("账号绑定公开 key 失败: %w", err)
 		}
