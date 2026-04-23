@@ -14,6 +14,10 @@ type ModelCapability struct {
 }
 
 var modelCatalog = map[string]ModelCapability{
+	"gpt-5.5": {
+		AllowedReasoningEfforts: []string{"low", "medium", "high", "xhigh"},
+		OpenAIVisible:           true,
+	},
 	"gpt-5.4": {
 		AllowedReasoningEfforts: []string{"low", "medium", "high", "xhigh"},
 		OpenAIVisible:           true,

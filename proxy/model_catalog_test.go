@@ -3,6 +3,9 @@ package proxy
 import "testing"
 
 func TestModelCatalog_BasicLookups(t *testing.T) {
+	if !IsModelAllowed("gpt-5.5") {
+		t.Fatal("gpt-5.5 should be allowed")
+	}
 	if !IsModelAllowed("gpt-5.4") {
 		t.Fatal("gpt-5.4 should be allowed")
 	}
@@ -24,9 +27,13 @@ func TestModelCatalog_ListPublicModels(t *testing.T) {
 	}
 
 	hasImage := false
+	has55 := false
 	for _, model := range models {
 		if model == "gpt-image-2" {
 			hasImage = true
+		}
+		if model == "gpt-5.5" {
+			has55 = true
 		}
 		if model == "gpt-5" {
 			t.Fatal("gpt-5 must not appear in public models")
@@ -34,6 +41,9 @@ func TestModelCatalog_ListPublicModels(t *testing.T) {
 	}
 	if !hasImage {
 		t.Fatal("expected gpt-image-2 in public models")
+	}
+	if !has55 {
+		t.Fatal("expected gpt-5.5 in public models")
 	}
 }
 
