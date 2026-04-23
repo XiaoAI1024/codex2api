@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -303,7 +304,7 @@ func (h *Handler) executeImageEndpoint(c *gin.Context, endpoint, imageModel, res
 			return
 		}
 
-		completed, failedMsg, readErr := collectCompletedImageEvent(resp.Body)
+		completed, streamItems, failedMsg, readErr := collectCompletedImageEvent(resp.Body)
 		resp.Body.Close()
 		if readErr != nil {
 			h.store.Release(account)
@@ -323,6 +324,16 @@ func (h *Handler) executeImageEndpoint(c *gin.Context, endpoint, imageModel, res
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
 			lastErr = parseErr
+			continue
+		}
+		if len(results) == 0 && len(streamItems) > 0 {
+			results = streamItems
+			firstMeta = streamItems[0]
+		}
+		if len(results) == 0 {
+			h.store.Release(account)
+			excludeAccounts[account.ID()] = true
+			lastErr = fmt.Errorf("upstream did not return image output")
 			continue
 		}
 
@@ -376,9 +387,11 @@ func (h *Handler) executeImageEndpoint(c *gin.Context, endpoint, imageModel, res
 	})
 }
 
-func collectCompletedImageEvent(body io.Reader) ([]byte, string, error) {
+func collectCompletedImageEvent(body io.Reader) ([]byte, []imageCallResult, string, error) {
 	var completedEvent []byte
 	var failedMessage string
+	itemsByIndex := make(map[int64]imageCallResult)
+	fallbackItems := make([]imageCallResult, 0, 2)
 
 	err := ReadSSEStream(body, func(data []byte) bool {
 		eventType := gjson.GetBytes(data, "type").String()
@@ -386,6 +399,15 @@ func collectCompletedImageEvent(body io.Reader) ([]byte, string, error) {
 		case "response.completed":
 			// 取最后一个 completed，兼容 usage 晚到。
 			completedEvent = append(completedEvent[:0], data...)
+		case "response.output_item.done":
+			item := gjson.GetBytes(data, "item")
+			if parsed, ok := parseImageCallResultFromItem(item); ok {
+				if idx := gjson.GetBytes(data, "output_index"); idx.Exists() {
+					itemsByIndex[idx.Int()] = parsed
+				} else {
+					fallbackItems = append(fallbackItems, parsed)
+				}
+			}
 		case "response.failed":
 			failedMessage = strings.TrimSpace(gjson.GetBytes(data, "response.error.message").String())
 			if failedMessage == "" {
@@ -395,15 +417,50 @@ func collectCompletedImageEvent(body io.Reader) ([]byte, string, error) {
 		return true
 	})
 	if err != nil {
-		return nil, "", err
+		return nil, nil, "", err
 	}
 	if failedMessage != "" {
-		return nil, failedMessage, nil
+		return nil, nil, failedMessage, nil
 	}
 	if len(completedEvent) == 0 {
-		return nil, "", fmt.Errorf("upstream did not return response.completed")
+		return nil, nil, "", fmt.Errorf("upstream did not return response.completed")
 	}
-	return completedEvent, "", nil
+	streamItems := make([]imageCallResult, 0, len(itemsByIndex)+len(fallbackItems))
+	if len(itemsByIndex) > 0 {
+		indexes := make([]int64, 0, len(itemsByIndex))
+		for idx := range itemsByIndex {
+			indexes = append(indexes, idx)
+		}
+		sort.Slice(indexes, func(i, j int) bool {
+			return indexes[i] < indexes[j]
+		})
+		for _, idx := range indexes {
+			streamItems = append(streamItems, itemsByIndex[idx])
+		}
+	}
+	streamItems = append(streamItems, fallbackItems...)
+	return completedEvent, streamItems, "", nil
+}
+
+func parseImageCallResultFromItem(item gjson.Result) (imageCallResult, bool) {
+	if !item.Exists() || !item.IsObject() {
+		return imageCallResult{}, false
+	}
+	if item.Get("type").String() != "image_generation_call" {
+		return imageCallResult{}, false
+	}
+	result := strings.TrimSpace(item.Get("result").String())
+	if result == "" {
+		return imageCallResult{}, false
+	}
+	return imageCallResult{
+		Result:        result,
+		RevisedPrompt: strings.TrimSpace(item.Get("revised_prompt").String()),
+		OutputFormat:  strings.TrimSpace(item.Get("output_format").String()),
+		Size:          strings.TrimSpace(item.Get("size").String()),
+		Background:    strings.TrimSpace(item.Get("background").String()),
+		Quality:       strings.TrimSpace(item.Get("quality").String()),
+	}, true
 }
 
 func extractImagesFromResponsesCompleted(payload []byte) (results []imageCallResult, createdAt int64, usageRaw []byte, firstMeta imageCallResult, err error) {
@@ -419,20 +476,9 @@ func extractImagesFromResponsesCompleted(payload []byte) (results []imageCallRes
 	output := gjson.GetBytes(payload, "response.output")
 	if output.IsArray() {
 		for _, item := range output.Array() {
-			if item.Get("type").String() != "image_generation_call" {
+			entry, ok := parseImageCallResultFromItem(item)
+			if !ok {
 				continue
-			}
-			result := strings.TrimSpace(item.Get("result").String())
-			if result == "" {
-				continue
-			}
-			entry := imageCallResult{
-				Result:        result,
-				RevisedPrompt: strings.TrimSpace(item.Get("revised_prompt").String()),
-				OutputFormat:  strings.TrimSpace(item.Get("output_format").String()),
-				Size:          strings.TrimSpace(item.Get("size").String()),
-				Background:    strings.TrimSpace(item.Get("background").String()),
-				Quality:       strings.TrimSpace(item.Get("quality").String()),
 			}
 			if len(results) == 0 {
 				firstMeta = entry
@@ -440,10 +486,6 @@ func extractImagesFromResponsesCompleted(payload []byte) (results []imageCallRes
 			results = append(results, entry)
 		}
 	}
-	if len(results) == 0 {
-		return nil, 0, nil, imageCallResult{}, fmt.Errorf("upstream did not return image output")
-	}
-
 	if usage := gjson.GetBytes(payload, "response.tool_usage.image_gen"); usage.Exists() && usage.IsObject() {
 		usageRaw = []byte(usage.Raw)
 	}

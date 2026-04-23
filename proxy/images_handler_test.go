@@ -116,12 +116,15 @@ func TestCollectCompletedImageEvent_LateCompletedWins(t *testing.T) {
 		"",
 	}, "\n"))
 
-	completed, failed, err := collectCompletedImageEvent(stream)
+	completed, streamItems, failed, err := collectCompletedImageEvent(stream)
 	if err != nil {
 		t.Fatalf("collectCompletedImageEvent failed: %v", err)
 	}
 	if failed != "" {
 		t.Fatalf("failed message should be empty, got %q", failed)
+	}
+	if len(streamItems) != 0 {
+		t.Fatalf("streamItems should be empty when completed contains output, got %d", len(streamItems))
 	}
 	if got := gjson.GetBytes(completed, "response.output.0.result").String(); got != "NEW" {
 		t.Fatalf("latest completed result = %q, want %q", got, "NEW")
@@ -134,15 +137,48 @@ func TestCollectCompletedImageEvent_LateCompletedWins(t *testing.T) {
 func TestCollectCompletedImageEvent_FailedMessage(t *testing.T) {
 	stream := strings.NewReader("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\n")
 
-	completed, failed, err := collectCompletedImageEvent(stream)
+	completed, streamItems, failed, err := collectCompletedImageEvent(stream)
 	if err != nil {
 		t.Fatalf("collectCompletedImageEvent failed: %v", err)
 	}
 	if completed != nil {
 		t.Fatalf("completed should be nil on failure, got %s", string(completed))
 	}
+	if len(streamItems) != 0 {
+		t.Fatalf("streamItems should be empty on failure, got %d", len(streamItems))
+	}
 	if failed != "boom" {
 		t.Fatalf("failed = %q, want %q", failed, "boom")
+	}
+}
+
+func TestCollectCompletedImageEvent_OutputItemFallback(t *testing.T) {
+	stream := strings.NewReader(strings.Join([]string{
+		`data: {"type":"response.output_item.done","output_index":1,"item":{"type":"image_generation_call","result":"BBBB","output_format":"png"}}`,
+		"",
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","result":"AAAA","output_format":"webp"}}`,
+		"",
+		`data: {"type":"response.completed","response":{"output":[],"tool_usage":{"image_gen":{"total_images":2}}}}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n"))
+
+	completed, streamItems, failed, err := collectCompletedImageEvent(stream)
+	if err != nil {
+		t.Fatalf("collectCompletedImageEvent failed: %v", err)
+	}
+	if failed != "" {
+		t.Fatalf("failed message should be empty, got %q", failed)
+	}
+	if got := gjson.GetBytes(completed, "type").String(); got != "response.completed" {
+		t.Fatalf("unexpected completed type: %q", got)
+	}
+	if len(streamItems) != 2 {
+		t.Fatalf("streamItems len = %d, want 2", len(streamItems))
+	}
+	if streamItems[0].Result != "AAAA" || streamItems[1].Result != "BBBB" {
+		t.Fatalf("fallback order mismatch: %+v", streamItems)
 	}
 }
 
@@ -203,8 +239,15 @@ func TestExtractImagesFromResponsesCompleted_ErrorPaths(t *testing.T) {
 		"type":"response.completed",
 		"response":{"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}
 	}`)
-	if _, _, _, _, err := extractImagesFromResponsesCompleted(payloadNoImage); err == nil {
-		t.Fatal("missing image_generation_call should return error")
+	results, _, usageRaw, _, err := extractImagesFromResponsesCompleted(payloadNoImage)
+	if err != nil {
+		t.Fatalf("missing image_generation_call should not return error: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("results len = %d, want 0", len(results))
+	}
+	if len(usageRaw) != 0 {
+		t.Fatalf("usageRaw should be empty when usage missing: %s", string(usageRaw))
 	}
 }
 
