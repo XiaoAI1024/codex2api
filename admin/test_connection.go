@@ -16,7 +16,6 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
-	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -105,43 +104,25 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		h.store.PersistUsageSnapshot(account, usagePct)
 	}
 
-	// 解析 SSE 流
-	collector := newCodexTextCollector()
-	completed := false
-	var terminalErr string
-	_ = proxy.ReadSSEStream(resp.Body, func(data []byte) bool {
-		eventType := gjson.GetBytes(data, "type").String()
-
-		switch eventType {
-		case "response.output_text.delta":
-			delta := collector.ConsumeEvent(data)
-			if delta != "" {
-				sendTestEvent(c, testEvent{Type: "content", Text: delta})
-			}
-		case "response.output_text.done", "response.output_item.done":
-			collector.ConsumeEvent(data)
-		case "response.completed":
-			completed = true
-			if text := collector.Complete(data); text != "" {
-				sendTestEvent(c, testEvent{Type: "content", Text: text})
-			}
-			return false
-		case "response.failed":
-			terminalErr = codexResponseFailedMessage(data)
-			return false
-		}
-		return true
+	streamResult, readErr := readCodexTextStream(resp.Body, func(delta string) {
+		sendTestEvent(c, testEvent{Type: "content", Text: delta})
 	})
-
-	if terminalErr != "" {
-		sendTestEvent(c, testEvent{Type: "error", Error: terminalErr})
+	if readErr != nil {
+		sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("读取测试响应失败: %s", readErr.Error())})
 		return
 	}
-	if !completed {
+	if streamResult.FinalText != "" {
+		sendTestEvent(c, testEvent{Type: "content", Text: streamResult.FinalText})
+	}
+	if streamResult.TerminalErr != "" {
+		sendTestEvent(c, testEvent{Type: "error", Error: streamResult.TerminalErr})
+		return
+	}
+	if !streamResult.Completed {
 		sendTestEvent(c, testEvent{Type: "error", Error: "测试未完成（未收到 response.completed）"})
 		return
 	}
-	if !collector.HasContent() {
+	if !streamResult.HasContent {
 		sendTestEvent(c, testEvent{Type: "error", Error: "未收到模型输出"})
 		return
 	}
@@ -168,6 +149,7 @@ func buildTestPayload(model string) []byte {
 	payload, _ = sjson.SetBytes(payload, "model", model)
 	payload, _ = sjson.SetBytes(payload, "input", []map[string]any{
 		{
+			"type": "message",
 			"role": "user",
 			"content": []map[string]any{
 				{
@@ -179,8 +161,10 @@ func buildTestPayload(model string) []byte {
 	})
 	payload, _ = sjson.SetBytes(payload, "stream", true)
 	payload, _ = sjson.SetBytes(payload, "store", false)
-	payload, _ = sjson.SetBytes(payload, "instructions", "You are a helpful assistant. Reply briefly.")
-	return payload
+	payload, _ = sjson.SetBytes(payload, "instructions", "")
+	payload, _ = sjson.SetBytes(payload, "parallel_tool_calls", true)
+	payload, _ = sjson.SetBytes(payload, "include", []string{"reasoning.encrypted_content"})
+	return ensureCLIProxyStyleImageGenerationTool(payload, model)
 }
 
 // sendTestEvent 发送 SSE 事件

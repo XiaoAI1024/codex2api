@@ -21,7 +21,6 @@ import (
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
-	"github.com/tidwall/gjson"
 )
 
 // RegisterCliproxyRoutes registers minimal CLIProxyAPI-compatible management routes.
@@ -794,36 +793,17 @@ func (h *Handler) validatePublicUploadedAccount(ctx context.Context, accountID i
 		h.store.PersistUsageSnapshot(account, usagePct)
 	}
 
-	collector := newCodexTextCollector()
-	completed := false
-	var terminalErr string
-	streamErr := proxy.ReadSSEStream(resp.Body, func(data []byte) bool {
-		eventType := gjson.GetBytes(data, "type").String()
-		switch eventType {
-		case "response.output_text.delta":
-			collector.ConsumeEvent(data)
-		case "response.output_text.done", "response.output_item.done":
-			collector.ConsumeEvent(data)
-		case "response.completed":
-			completed = true
-			collector.Complete(data)
-			return false
-		case "response.failed":
-			terminalErr = codexResponseFailedMessage(data)
-			return false
-		}
-		return true
-	})
+	streamResult, streamErr := readCodexTextStream(resp.Body, nil)
 	if streamErr != nil {
 		return fmt.Errorf("读取测试响应失败: %w", streamErr)
 	}
-	if terminalErr != "" {
-		return errors.New(terminalErr)
+	if streamResult.TerminalErr != "" {
+		return errors.New(streamResult.TerminalErr)
 	}
-	if !completed {
+	if !streamResult.Completed {
 		return errors.New("测试未完成（未收到 response.completed）")
 	}
-	if !collector.HasContent() {
+	if !streamResult.HasContent {
 		return errors.New("测试未收到模型输出")
 	}
 

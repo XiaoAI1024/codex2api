@@ -11,7 +11,6 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
-	"github.com/tidwall/sjson"
 )
 
 type probeModelSupportRequest struct {
@@ -72,7 +71,6 @@ func (h *Handler) ProbeGPT55Capability(ctx context.Context, account *auth.Accoun
 	}
 
 	payload := buildTestPayload("gpt-5.5")
-	payload, _ = sjson.SetBytes(payload, "stream", false)
 
 	proxyURL := h.store.NextProxy()
 	resp, err := proxy.ExecuteRequest(ctx, account, payload, "", proxyURL, "", nil, nil)
@@ -81,16 +79,16 @@ func (h *Handler) ProbeGPT55Capability(ctx context.Context, account *auth.Accoun
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
 	if usagePct, ok := proxy.ParseCodexUsageHeaders(resp, account); ok {
 		h.store.PersistUsageSnapshot(account, usagePct)
 	}
 
-	displayStatus := proxy.NormalizeUpstreamStatusCode(resp.StatusCode, body)
-	errCode, errMsg := proxy.ParseUpstreamErrorBrief(body)
-
 	switch {
 	case resp.StatusCode == http.StatusOK:
+		streamResult := parseSuccessfulGPT55ProbeResponse(resp)
+		if streamResult.Outcome != auth.GPT55ProbeOutcomeSupported {
+			return streamResult
+		}
 		account.ClearLastFailureDetail()
 		if _, cooldownReason, active := account.GetCooldownSnapshot(); active && cooldownReason == "full_usage" {
 			if !h.store.MarkFullUsageCooldownFromSnapshot(account) {
@@ -101,6 +99,13 @@ func (h *Handler) ProbeGPT55Capability(ctx context.Context, account *auth.Accoun
 		}
 		h.store.ReportRequestSuccess(account, 0)
 		return auth.GPT55ProbeResult{Outcome: auth.GPT55ProbeOutcomeSupported}
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	displayStatus := proxy.NormalizeUpstreamStatusCode(resp.StatusCode, body)
+	errCode, errMsg := proxy.ParseUpstreamErrorBrief(body)
+
+	switch {
 	case proxy.IsUnauthorizedLikeStatus(resp.StatusCode, body):
 		if errCode == "" {
 			errCode = "unauthorized"
