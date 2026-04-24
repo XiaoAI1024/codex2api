@@ -794,19 +794,22 @@ func (h *Handler) validatePublicUploadedAccount(ctx context.Context, accountID i
 		h.store.PersistUsageSnapshot(account, usagePct)
 	}
 
-	hasContent := false
+	collector := newCodexTextCollector()
 	completed := false
+	var terminalErr string
 	streamErr := proxy.ReadSSEStream(resp.Body, func(data []byte) bool {
 		eventType := gjson.GetBytes(data, "type").String()
 		switch eventType {
 		case "response.output_text.delta":
-			if strings.TrimSpace(gjson.GetBytes(data, "delta").String()) != "" {
-				hasContent = true
-			}
+			collector.ConsumeEvent(data)
+		case "response.output_text.done", "response.output_item.done":
+			collector.ConsumeEvent(data)
 		case "response.completed":
 			completed = true
+			collector.Complete(data)
 			return false
 		case "response.failed":
+			terminalErr = codexResponseFailedMessage(data)
 			return false
 		}
 		return true
@@ -814,10 +817,13 @@ func (h *Handler) validatePublicUploadedAccount(ctx context.Context, accountID i
 	if streamErr != nil {
 		return fmt.Errorf("读取测试响应失败: %w", streamErr)
 	}
+	if terminalErr != "" {
+		return errors.New(terminalErr)
+	}
 	if !completed {
 		return errors.New("测试未完成（未收到 response.completed）")
 	}
-	if !hasContent {
+	if !collector.HasContent() {
 		return errors.New("测试未收到模型输出")
 	}
 

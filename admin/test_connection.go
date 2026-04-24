@@ -106,47 +106,60 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	}
 
 	// 解析 SSE 流
-	hasContent := false
+	collector := newCodexTextCollector()
+	completed := false
+	var terminalErr string
 	_ = proxy.ReadSSEStream(resp.Body, func(data []byte) bool {
 		eventType := gjson.GetBytes(data, "type").String()
 
 		switch eventType {
 		case "response.output_text.delta":
-			delta := gjson.GetBytes(data, "delta").String()
+			delta := collector.ConsumeEvent(data)
 			if delta != "" {
-				hasContent = true
 				sendTestEvent(c, testEvent{Type: "content", Text: delta})
 			}
+		case "response.output_text.done", "response.output_item.done":
+			collector.ConsumeEvent(data)
 		case "response.completed":
-			account.ClearLastFailureDetail()
-			if _, cooldownReason, active := account.GetCooldownSnapshot(); active && cooldownReason == "full_usage" {
-				if !h.store.MarkFullUsageCooldownFromSnapshot(account) {
-					h.store.ClearCooldown(account)
-				}
-			} else {
-				h.store.ClearCooldown(account)
+			completed = true
+			if text := collector.Complete(data); text != "" {
+				sendTestEvent(c, testEvent{Type: "content", Text: text})
 			}
-			duration := time.Since(start).Milliseconds()
-			sendTestEvent(c, testEvent{
-				Type: "content",
-				Text: fmt.Sprintf("\n\n--- 耗时 %dms ---", duration),
-			})
-			sendTestEvent(c, testEvent{Type: "test_complete", Success: true})
 			return false
 		case "response.failed":
-			errMsg := gjson.GetBytes(data, "response.status_details.error.message").String()
-			if errMsg == "" {
-				errMsg = "上游返回 response.failed"
-			}
-			sendTestEvent(c, testEvent{Type: "error", Error: errMsg})
+			terminalErr = codexResponseFailedMessage(data)
 			return false
 		}
 		return true
 	})
 
-	if !hasContent {
-		sendTestEvent(c, testEvent{Type: "error", Error: "未收到模型输出"})
+	if terminalErr != "" {
+		sendTestEvent(c, testEvent{Type: "error", Error: terminalErr})
+		return
 	}
+	if !completed {
+		sendTestEvent(c, testEvent{Type: "error", Error: "测试未完成（未收到 response.completed）"})
+		return
+	}
+	if !collector.HasContent() {
+		sendTestEvent(c, testEvent{Type: "error", Error: "未收到模型输出"})
+		return
+	}
+
+	account.ClearLastFailureDetail()
+	if _, cooldownReason, active := account.GetCooldownSnapshot(); active && cooldownReason == "full_usage" {
+		if !h.store.MarkFullUsageCooldownFromSnapshot(account) {
+			h.store.ClearCooldown(account)
+		}
+	} else {
+		h.store.ClearCooldown(account)
+	}
+	duration := time.Since(start).Milliseconds()
+	sendTestEvent(c, testEvent{
+		Type: "content",
+		Text: fmt.Sprintf("\n\n--- 耗时 %dms ---", duration),
+	})
+	sendTestEvent(c, testEvent{Type: "test_complete", Success: true})
 }
 
 // buildTestPayload 构建最小测试请求体
