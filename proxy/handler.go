@@ -456,6 +456,70 @@ func (h *Handler) accountMatcherForCurrentPort(c *gin.Context) auth.AccountMatch
 	}
 }
 
+func composeAccountMatchers(matchers ...auth.AccountMatcher) auth.AccountMatcher {
+	return func(acc *auth.Account) bool {
+		for _, matcher := range matchers {
+			if matcher != nil && !matcher(acc) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+func supportsGPT55Matcher(acc *auth.Account) bool {
+	if acc == nil {
+		return false
+	}
+	supported, checkedAt, _ := acc.GPT55CapabilitySnapshot()
+	return supported && !checkedAt.IsZero()
+}
+
+func (h *Handler) lazyProbeGPT55CapableAccount(ctx context.Context, exclude map[int64]bool, baseMatcher auth.AccountMatcher, supportedMatcher auth.AccountMatcher, attempted map[int64]bool) *auth.Account {
+	if h == nil || h.store == nil {
+		return nil
+	}
+	accounts := h.store.Accounts()
+	for _, acc := range accounts {
+		if acc == nil {
+			continue
+		}
+		if exclude != nil && exclude[acc.ID()] {
+			continue
+		}
+		if attempted != nil && attempted[acc.ID()] {
+			continue
+		}
+		if baseMatcher != nil && !baseMatcher(acc) {
+			continue
+		}
+		if !acc.IsAvailable() || !acc.NeedsGPT55Probe(auth.GPT55ProbeCacheTTL) {
+			continue
+		}
+		if attempted != nil {
+			attempted[acc.ID()] = true
+		}
+
+		probeCtx := ctx
+		cancel := func() {}
+		if probeCtx == nil {
+			probeCtx = context.Background()
+		}
+		if _, hasDeadline := probeCtx.Deadline(); !hasDeadline {
+			probeCtx, cancel = context.WithTimeout(probeCtx, 25*time.Second)
+		}
+		result := h.store.ProbeGPT55Account(probeCtx, acc, false)
+		cancel()
+
+		if result.Outcome == auth.GPT55ProbeOutcomeSupported {
+			if picked := h.store.NextMatching(exclude, supportedMatcher); picked != nil {
+				return picked
+			}
+		}
+	}
+	return nil
+}
+
 func (h *Handler) acquireAccountForRequest(c *gin.Context, exclude map[int64]bool) *auth.Account {
 	if h == nil || h.store == nil {
 		return nil
@@ -463,7 +527,17 @@ func (h *Handler) acquireAccountForRequest(c *gin.Context, exclude map[int64]boo
 	if exclude == nil {
 		exclude = make(map[int64]bool)
 	}
-	matcher := h.accountMatcherForCurrentPort(c)
+	requestCtx := context.Background()
+	if c != nil && c.Request != nil {
+		requestCtx = c.Request.Context()
+	}
+	baseMatcher := h.accountMatcherForCurrentPort(c)
+	matcher := baseMatcher
+	gpt55ProbeAttempted := make(map[int64]bool)
+	requiresGPT55Support := c != nil && strings.EqualFold(strings.TrimSpace(c.GetString("x-model")), "gpt-5.5")
+	if requiresGPT55Support {
+		matcher = composeAccountMatchers(baseMatcher, supportsGPT55Matcher)
+	}
 	startedAt := requestStartTime(c)
 	waitRounds := 0
 
@@ -500,10 +574,16 @@ func (h *Handler) acquireAccountForRequest(c *gin.Context, exclude map[int64]boo
 		logSlowAcquire(acc)
 		return acc
 	}
+	if requiresGPT55Support {
+		if acc := h.lazyProbeGPT55CapableAccount(requestCtx, exclude, baseMatcher, matcher, gpt55ProbeAttempted); acc != nil {
+			logSlowAcquire(acc)
+			return acc
+		}
+	}
 
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		if c.Request.Context().Err() != nil || time.Now().After(deadline) {
+		if requestCtx.Err() != nil || time.Now().After(deadline) {
 			return nil
 		}
 		waitFor := time.Until(deadline)
@@ -514,8 +594,14 @@ func (h *Handler) acquireAccountForRequest(c *gin.Context, exclude map[int64]boo
 			return nil
 		}
 		waitRounds++
-		acc := h.store.WaitForAvailableMatching(c.Request.Context(), waitFor, exclude, matcher)
+		acc := h.store.WaitForAvailableMatching(requestCtx, waitFor, exclude, matcher)
 		if acc == nil {
+			if requiresGPT55Support {
+				if probed := h.lazyProbeGPT55CapableAccount(requestCtx, exclude, baseMatcher, matcher, gpt55ProbeAttempted); probed != nil {
+					logSlowAcquire(probed)
+					return probed
+				}
+			}
 			if c != nil {
 				c.Set("x-scheduler-acquire-ms", time.Since(startedAt).Milliseconds())
 				c.Set("x-scheduler-wait-rounds", waitRounds)
@@ -773,6 +859,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		api.SendMissingFieldError(c, "model")
 		return
 	}
+	c.Set("x-model", model)
 	if IsImageOnlyModel(model) {
 		api.SendError(c, api.NewAPIError(
 			api.ErrCodeUnsupportedModel,
@@ -1260,6 +1347,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	if model == "" {
 		model = "gpt-5.4"
 	}
+	c.Set("x-model", model)
 	if IsImageOnlyModel(model) {
 		api.SendError(c, api.NewAPIError(
 			api.ErrCodeUnsupportedModel,

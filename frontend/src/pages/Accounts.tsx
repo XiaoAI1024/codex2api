@@ -262,6 +262,7 @@ export default function Accounts() {
   const [refreshingIds, setRefreshingIds] = useState<Set<number>>(new Set())
   const [batchLoading, setBatchLoading] = useState(false)
   const [batchTesting, setBatchTesting] = useState(false)
+  const [batchProbingGPT55, setBatchProbingGPT55] = useState(false)
   const [batchRefreshingAll, setBatchRefreshingAll] = useState(false)
   const [cleaningBanned, setCleaningBanned] = useState(false)
   const [cleaningRateLimited, setCleaningRateLimited] = useState(false)
@@ -946,6 +947,23 @@ export default function Accounts() {
     }
   }
 
+  const handleBatchProbeGPT55 = async () => {
+    setBatchProbingGPT55(true)
+    try {
+      const result = await api.probeModelSupport({ model: 'gpt-5.5', force: true })
+      showToast(t('accounts.batchProbeGPT55Done', {
+        supported: result.supported,
+        unsupported: result.unsupported,
+        failed: result.failed,
+      }))
+      void reload()
+    } catch (error) {
+      showToast(t('accounts.batchProbeGPT55Failed', { error: getErrorMessage(error) }), 'error')
+    } finally {
+      setBatchProbingGPT55(false)
+    }
+  }
+
   const handleCleanBanned = async () => {
     const confirmed = await confirm({
       title: t('accounts.cleanBannedTitle'),
@@ -1026,6 +1044,10 @@ export default function Accounts() {
               <Button variant="outline" size="sm" disabled={batchTesting} onClick={() => void handleBatchTest()}>
                 <FlaskConical className="size-3" />
                 {batchTesting ? t('accounts.batchTesting') : t('accounts.batchTest')}
+              </Button>
+              <Button variant="outline" size="sm" disabled={batchProbingGPT55} onClick={() => void handleBatchProbeGPT55()}>
+                <Zap className="size-3" />
+                {batchProbingGPT55 ? t('accounts.batchProbingGPT55') : t('accounts.batchProbeGPT55')}
               </Button>
               <Button variant="outline" size="sm" disabled={batchRefreshingAll} onClick={() => void handleBatchRefreshAll()}>
                 <RefreshCw className="size-3" />

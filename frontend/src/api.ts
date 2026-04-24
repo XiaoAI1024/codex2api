@@ -185,6 +185,11 @@ export const api = {
   getModels: () => request<{ models: string[] }>('/models'),
   batchTestAccounts: () =>
     request<{ total: number; success: number; failed: number; banned: number; rate_limited: number }>('/accounts/batch-test', { method: 'POST' }),
+  probeModelSupport: (data: { model: string; concurrency?: number; force?: boolean }) =>
+    request<{ model: string; total: number; supported: number; unsupported: number; failed: number }>('/accounts/probe-model', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   batchRefreshAccounts: () =>
     request<{ total: number; refreshable: number; success: number; failed: number; skipped_no_rt: number }>('/accounts/batch-refresh', { method: 'POST' }),
   cleanBanned: () =>

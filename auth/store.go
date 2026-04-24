@@ -28,6 +28,7 @@ const (
 
 const RateLimitedProbeInterval = 2 * time.Hour
 const FullUsageProbeInterval = 4 * time.Hour
+const GPT55ProbeCacheTTL = 24 * time.Hour
 const rateLimitedWaitStep = 2 * time.Hour
 const fullUsageWaitFallback = 12 * time.Hour
 
@@ -75,6 +76,12 @@ type Account struct {
 	CooldownUtil   time.Time
 	CooldownReason string // rate_limited / unauthorized / 空
 	ErrorMsg       string
+
+	// 模型能力探测（当前仅 gpt-5.5）
+	SupportsGPT55      bool
+	GPT55CheckedAt     time.Time
+	GPT55LastError     string
+	gpt55ProbeInFlight bool
 
 	// 用量进度（从 Codex 响应头被动解析）
 	UsagePercent7d        float64 // 7d 窗口使用率 0-100+
@@ -155,6 +162,27 @@ func (a *Account) ID() int64 {
 // Mu 返回读写锁（供外部包安全读取字段）
 func (a *Account) Mu() *sync.RWMutex {
 	return &a.mu
+}
+
+func credentialBool(raw interface{}) (bool, bool) {
+	switch v := raw.(type) {
+	case bool:
+		return v, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			return true, true
+		case "0", "false", "no", "off":
+			return false, true
+		}
+	case float64:
+		return v != 0, true
+	case int:
+		return v != 0, true
+	case int64:
+		return v != 0, true
+	}
+	return false, false
 }
 
 func clampInt(value, minValue, maxValue int) int {
@@ -723,6 +751,67 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 	return time.Since(a.UsageUpdatedAt) > maxAge
 }
 
+// GPT55CapabilitySnapshot 返回 gpt-5.5 能力探测快照。
+func (a *Account) GPT55CapabilitySnapshot() (supported bool, checkedAt time.Time, lastError string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.SupportsGPT55, a.GPT55CheckedAt, a.GPT55LastError
+}
+
+// SetGPT55Capability 设置 gpt-5.5 能力探测结果。
+func (a *Account) SetGPT55Capability(supported bool, checkedAt time.Time, lastError string) {
+	a.mu.Lock()
+	a.SupportsGPT55 = supported
+	a.GPT55CheckedAt = checkedAt
+	a.GPT55LastError = strings.TrimSpace(lastError)
+	a.mu.Unlock()
+}
+
+// SetGPT55ProbeFailure 记录一次非确定性探测失败，不覆盖已知支持状态。
+func (a *Account) SetGPT55ProbeFailure(lastError string) {
+	a.mu.Lock()
+	a.GPT55LastError = strings.TrimSpace(lastError)
+	a.mu.Unlock()
+}
+
+// NeedsGPT55Probe 判断是否需要重新探测 gpt-5.5 能力。
+func (a *Account) NeedsGPT55Probe(maxAge time.Duration) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.gpt55ProbeInFlight || a.AccessToken == "" || a.Status == StatusError {
+		return false
+	}
+	if a.healthTierLocked() == HealthTierBanned {
+		return false
+	}
+	if a.GPT55CheckedAt.IsZero() {
+		return true
+	}
+	if maxAge <= 0 {
+		return false
+	}
+	return time.Since(a.GPT55CheckedAt) > maxAge
+}
+
+// TryBeginGPT55Probe 尝试开始一次 gpt-5.5 能力探测。
+func (a *Account) TryBeginGPT55Probe() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.gpt55ProbeInFlight {
+		return false
+	}
+	a.gpt55ProbeInFlight = true
+	return true
+}
+
+// FinishGPT55Probe 结束一次 gpt-5.5 能力探测。
+func (a *Account) FinishGPT55Probe() {
+	a.mu.Lock()
+	a.gpt55ProbeInFlight = false
+	a.mu.Unlock()
+}
+
 // TryBeginUsageProbe 尝试开始一次用量探针
 func (a *Account) TryBeginUsageProbe() bool {
 	a.mu.Lock()
@@ -819,6 +908,8 @@ type Store struct {
 	tokenCache              cache.TokenCache
 	usageProbeMu            sync.RWMutex
 	usageProbe              func(context.Context, *Account) error
+	gpt55ProbeMu            sync.RWMutex
+	gpt55Probe              func(context.Context, *Account) GPT55ProbeResult
 	usageProbeBatch         atomic.Bool
 	recoveryProbeBatch      atomic.Bool
 	autoCleanUnauthorized   atomic.Bool
@@ -855,6 +946,37 @@ type Store struct {
 // AccountMatcher 用于在调度阶段对账号做额外过滤。
 // 返回 true 表示该账号允许参与本次调度。
 type AccountMatcher func(*Account) bool
+
+type GPT55ProbeOutcome string
+
+const (
+	GPT55ProbeOutcomeSupported   GPT55ProbeOutcome = "supported"
+	GPT55ProbeOutcomeUnsupported GPT55ProbeOutcome = "unsupported"
+	GPT55ProbeOutcomeFailed      GPT55ProbeOutcome = "failed"
+)
+
+type GPT55ProbeResult struct {
+	Outcome   GPT55ProbeOutcome
+	LastError string
+}
+
+func gpt55ProbeResultFromSnapshot(acc *Account) GPT55ProbeResult {
+	if acc == nil {
+		return GPT55ProbeResult{Outcome: GPT55ProbeOutcomeFailed, LastError: "账号不存在"}
+	}
+	supported, checkedAt, lastError := acc.GPT55CapabilitySnapshot()
+	switch {
+	case checkedAt.IsZero():
+		if strings.TrimSpace(lastError) == "" {
+			lastError = "gpt-5.5 探测尚未完成"
+		}
+		return GPT55ProbeResult{Outcome: GPT55ProbeOutcomeFailed, LastError: strings.TrimSpace(lastError)}
+	case supported:
+		return GPT55ProbeResult{Outcome: GPT55ProbeOutcomeSupported}
+	default:
+		return GPT55ProbeResult{Outcome: GPT55ProbeOutcomeUnsupported, LastError: strings.TrimSpace(lastError)}
+	}
+}
 
 func fastSchedulerEnabledFromEnv() bool {
 	for _, key := range []string{"FAST_SCHEDULER_ENABLED", "CODEX_FAST_SCHEDULER"} {
@@ -1378,6 +1500,17 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 				}
 			}
 		}
+		if supported, ok := credentialBool(row.Credentials["supports_gpt_5_5"]); ok {
+			account.SupportsGPT55 = supported
+		}
+		if checkedAt := row.GetCredential("gpt_5_5_checked_at"); checkedAt != "" {
+			if parsed, err := time.Parse(time.RFC3339, checkedAt); err == nil {
+				account.GPT55CheckedAt = parsed
+			} else {
+				log.Printf("[账号 %d] 解析 gpt_5_5_checked_at 失败: %v", row.ID, err)
+			}
+		}
+		account.GPT55LastError = strings.TrimSpace(row.GetCredential("gpt_5_5_last_error"))
 		if row.CooldownUntil.Valid {
 			now := time.Now()
 			if now.Before(row.CooldownUntil.Time) {
@@ -2031,6 +2164,103 @@ func (s *Store) SetUsageProbeFunc(fn func(context.Context, *Account) error) {
 	s.usageProbeMu.Lock()
 	defer s.usageProbeMu.Unlock()
 	s.usageProbe = fn
+}
+
+// SetGPT55ProbeFunc 注册 gpt-5.5 能力探测回调。
+func (s *Store) SetGPT55ProbeFunc(fn func(context.Context, *Account) GPT55ProbeResult) {
+	s.gpt55ProbeMu.Lock()
+	defer s.gpt55ProbeMu.Unlock()
+	s.gpt55Probe = fn
+}
+
+func (s *Store) persistGPT55ProbeResult(ctx context.Context, acc *Account, result GPT55ProbeResult) error {
+	if s == nil || acc == nil {
+		return nil
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	lastError := strings.TrimSpace(result.LastError)
+
+	switch result.Outcome {
+	case GPT55ProbeOutcomeSupported:
+		acc.SetGPT55Capability(true, time.Now().UTC(), "")
+		if s.db == nil {
+			return nil
+		}
+		return s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{
+			"supports_gpt_5_5":   true,
+			"gpt_5_5_checked_at": now,
+			"gpt_5_5_last_error": "",
+		})
+	case GPT55ProbeOutcomeUnsupported:
+		acc.SetGPT55Capability(false, time.Now().UTC(), lastError)
+		if s.db == nil {
+			return nil
+		}
+		return s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{
+			"supports_gpt_5_5":   false,
+			"gpt_5_5_checked_at": now,
+			"gpt_5_5_last_error": lastError,
+		})
+	default:
+		acc.SetGPT55ProbeFailure(lastError)
+		if s.db == nil {
+			return nil
+		}
+		return s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{
+			"gpt_5_5_last_error": lastError,
+		})
+	}
+}
+
+// ProbeGPT55Account 主动探测单个账号是否支持 gpt-5.5，并同步到内存与数据库。
+func (s *Store) ProbeGPT55Account(ctx context.Context, acc *Account, force bool) GPT55ProbeResult {
+	if s == nil || acc == nil {
+		return GPT55ProbeResult{Outcome: GPT55ProbeOutcomeFailed, LastError: "账号不存在"}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	if !force && !acc.NeedsGPT55Probe(GPT55ProbeCacheTTL) {
+		return gpt55ProbeResultFromSnapshot(acc)
+	}
+	if !acc.TryBeginGPT55Probe() {
+		return gpt55ProbeResultFromSnapshot(acc)
+	}
+	defer acc.FinishGPT55Probe()
+
+	acc.Mu().RLock()
+	hasToken := strings.TrimSpace(acc.AccessToken) != ""
+	hasRefreshToken := strings.TrimSpace(acc.RefreshToken) != ""
+	needsRefresh := acc.NeedsRefresh()
+	acc.Mu().RUnlock()
+	if (!hasToken || needsRefresh) && hasRefreshToken {
+		if err := s.refreshAccount(ctx, acc); err != nil {
+			result := GPT55ProbeResult{Outcome: GPT55ProbeOutcomeFailed, LastError: err.Error()}
+			if persistErr := s.persistGPT55ProbeResult(context.Background(), acc, result); persistErr != nil {
+				log.Printf("[账号 %d] 持久化 gpt-5.5 刷新失败结果失败: %v", acc.DBID, persistErr)
+			}
+			return result
+		}
+	}
+
+	s.gpt55ProbeMu.RLock()
+	probeFn := s.gpt55Probe
+	s.gpt55ProbeMu.RUnlock()
+	if probeFn == nil {
+		result := GPT55ProbeResult{Outcome: GPT55ProbeOutcomeFailed, LastError: "gpt-5.5 probe not configured"}
+		if persistErr := s.persistGPT55ProbeResult(context.Background(), acc, result); persistErr != nil {
+			log.Printf("[账号 %d] 持久化 gpt-5.5 未配置结果失败: %v", acc.DBID, persistErr)
+		}
+		return result
+	}
+
+	result := probeFn(ctx, acc)
+	if persistErr := s.persistGPT55ProbeResult(context.Background(), acc, result); persistErr != nil {
+		log.Printf("[账号 %d] 持久化 gpt-5.5 探测结果失败: %v", acc.DBID, persistErr)
+	}
+	return result
 }
 
 // TriggerUsageProbeAsync 异步触发一次批量用量探针

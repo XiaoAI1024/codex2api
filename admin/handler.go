@@ -34,6 +34,7 @@ type Handler struct {
 	db             *database.DB
 	rateLimiter    *proxy.RateLimiter
 	refreshAccount func(context.Context, int64) error
+	probeGPT55     func(context.Context, *auth.Account, bool) auth.GPT55ProbeResult
 	cpuSampler     *cpuSampler
 	startedAt      time.Time
 	pgMaxConns     int
@@ -76,6 +77,12 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		planSyncAt:     make(map[int64]time.Time),
 	}
 	handler.refreshAccount = handler.refreshSingleAccount
+	handler.probeGPT55 = func(ctx context.Context, account *auth.Account, force bool) auth.GPT55ProbeResult {
+		if handler.store == nil {
+			return auth.GPT55ProbeResult{Outcome: auth.GPT55ProbeOutcomeFailed, LastError: "账号池未初始化"}
+		}
+		return handler.store.ProbeGPT55Account(ctx, account, force)
+	}
 	return handler
 }
 
@@ -102,6 +109,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/:id/test", h.TestConnection)
 	api.GET("/accounts/:id/usage", h.GetAccountUsage)
 	api.POST("/accounts/batch-test", h.BatchTest)
+	api.POST("/accounts/probe-model", h.ProbeModelSupport)
 	api.POST("/accounts/batch-refresh", h.BatchRefresh)
 	api.POST("/accounts/clean-banned", h.CleanBanned)
 	api.POST("/accounts/clean-rate-limited", h.CleanRateLimited)
