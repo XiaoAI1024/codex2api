@@ -14,6 +14,13 @@ type codexRequestIdentity struct {
 	Version   string
 }
 
+// ShouldSuppressCodexVersionHeader 返回该模型是否应去掉 Version 请求头。
+// 当前仅对 gpt-5.5 家族生效；一旦命中，默认画像和下游显式 Version 都会被抑制。
+func ShouldSuppressCodexVersionHeader(model string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(normalized, "gpt-5.5")
+}
+
 // ResolveCodexHeaderIdentity 解析上游请求需要使用的 UA/Version。
 // 该函数用于在 HTTP 与 WebSocket 两条链路上统一请求身份策略。
 func ResolveCodexHeaderIdentity(account *auth.Account, apiKey string, downstreamHeaders http.Header, deviceCfg *DeviceProfileConfig) (userAgent string, version string) {
@@ -80,7 +87,7 @@ func ensureHeader(target http.Header, source http.Header, key, fallback string) 
 	}
 }
 
-func applyCodexRequestHeaders(req *http.Request, accessToken, accountID, sessionID string, identity codexRequestIdentity, stream bool, downstreamHeaders http.Header) {
+func applyCodexRequestHeaders(req *http.Request, model, accessToken, accountID, sessionID string, identity codexRequestIdentity, stream bool, downstreamHeaders http.Header) {
 	if req == nil {
 		return
 	}
@@ -97,8 +104,9 @@ func applyCodexRequestHeaders(req *http.Request, accessToken, accountID, session
 	if identity.UserAgent != "" {
 		req.Header.Set("User-Agent", identity.UserAgent)
 	}
-	// 对齐 CLIProxyAPI：默认不主动合成 Version 请求头，仅在下游显式传入时透传。
-	ensureHeader(req.Header, downstreamHeaders, "Version", "")
+	if !ShouldSuppressCodexVersionHeader(model) {
+		ensureHeader(req.Header, downstreamHeaders, "Version", identity.Version)
+	}
 
 	ensureHeader(req.Header, downstreamHeaders, "X-Codex-Turn-Metadata", "")
 	ensureHeader(req.Header, downstreamHeaders, "X-Codex-Turn-State", "")

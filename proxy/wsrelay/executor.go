@@ -86,7 +86,8 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	}
 
 	// 准备请求头
-	headers := e.prepareWebsocketHeaders(accessToken, account, accountIDStr, apiKey, deviceCfg, downstreamHeaders)
+	requestModel := strings.TrimSpace(gjson.GetBytes(requestBody, "model").String())
+	headers := e.prepareWebsocketHeaders(requestModel, accessToken, account, accountIDStr, apiKey, deviceCfg, downstreamHeaders)
 
 	// 获取或创建连接
 	wc, err := e.manager.AcquireConnection(ctx, account, wsURL, headers, proxyOverride)
@@ -181,6 +182,7 @@ func ensureWebsocketHeader(target http.Header, source http.Header, key, fallback
 }
 
 func (e *Executor) prepareWebsocketHeaders(
+	model string,
 	accessToken string,
 	account *auth.Account,
 	accountID string,
@@ -205,8 +207,9 @@ func (e *Executor) prepareWebsocketHeaders(
 	if strings.TrimSpace(userAgent) != "" {
 		headers.Set("User-Agent", strings.TrimSpace(userAgent))
 	}
-	// 对齐 CLIProxyAPI：默认不主动合成 Version 请求头，仅在下游显式传入时透传。
-	ensureWebsocketHeader(headers, downstreamHeaders, "Version", "")
+	if !proxy.ShouldSuppressCodexVersionHeader(model) {
+		ensureWebsocketHeader(headers, downstreamHeaders, "Version", proxy.StableCodexVersion)
+	}
 
 	ensureWebsocketHeader(headers, downstreamHeaders, "Session_id", uuid.NewString())
 	ensureWebsocketHeader(headers, downstreamHeaders, "X-Client-Request-Id", uuid.NewString())

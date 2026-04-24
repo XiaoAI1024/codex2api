@@ -39,7 +39,7 @@ func TestApplyCodexRequestHeaders(t *testing.T) {
 		UserAgent: "codex_cli_rs/0.120.0 (Mac OS 15.5.0; arm64) Apple_Terminal/464",
 		Version:   "0.120.0",
 	}
-	applyCodexRequestHeaders(req, "token", "acc-id", "session-123", identity, true, nil)
+	applyCodexRequestHeaders(req, "gpt-5.4", "token", "acc-id", "session-123", identity, true, nil)
 
 	if got := req.Header.Get("Authorization"); got != "Bearer token" {
 		t.Fatalf("Authorization = %q", got)
@@ -47,8 +47,8 @@ func TestApplyCodexRequestHeaders(t *testing.T) {
 	if got := req.Header.Get("User-Agent"); got != identity.UserAgent {
 		t.Fatalf("User-Agent = %q", got)
 	}
-	if got := req.Header.Get("Version"); got != "" {
-		t.Fatalf("Version = %q, want empty by default", got)
+	if got := req.Header.Get("Version"); got != identity.Version {
+		t.Fatalf("Version = %q, want %q", got, identity.Version)
 	}
 	if got := req.Header.Get("Session_id"); got != "session-123" {
 		t.Fatalf("Session_id = %q", got)
@@ -67,7 +67,7 @@ func TestApplyCodexRequestHeaders(t *testing.T) {
 	}
 }
 
-func TestApplyCodexRequestHeaders_ForwardsExplicitVersionHeader(t *testing.T) {
+func TestApplyCodexRequestHeaders_ForwardsExplicitVersionHeaderForNonGPT55(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
@@ -80,9 +80,47 @@ func TestApplyCodexRequestHeaders_ForwardsExplicitVersionHeader(t *testing.T) {
 	downstreamHeaders := http.Header{}
 	downstreamHeaders.Set("Version", "0.130.0")
 
-	applyCodexRequestHeaders(req, "token", "acc-id", "session-123", identity, true, downstreamHeaders)
+	applyCodexRequestHeaders(req, "gpt-5.4", "token", "acc-id", "session-123", identity, true, downstreamHeaders)
 
 	if got := req.Header.Get("Version"); got != "0.130.0" {
 		t.Fatalf("Version = %q, want downstream header", got)
+	}
+}
+
+func TestApplyCodexRequestHeaders_SuppressesVersionForGPT55ByDefault(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+
+	identity := codexRequestIdentity{
+		UserAgent: "codex_cli_rs/0.120.0 (Mac OS 15.5.0; arm64) Apple_Terminal/464",
+		Version:   "0.120.0",
+	}
+
+	applyCodexRequestHeaders(req, "gpt-5.5", "token", "acc-id", "session-123", identity, true, nil)
+
+	if got := req.Header.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty for gpt-5.5", got)
+	}
+}
+
+func TestApplyCodexRequestHeaders_SuppressesExplicitVersionForGPT55(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+
+	identity := codexRequestIdentity{
+		UserAgent: "codex_cli_rs/0.120.0 (Mac OS 15.5.0; arm64) Apple_Terminal/464",
+		Version:   "0.120.0",
+	}
+	downstreamHeaders := http.Header{}
+	downstreamHeaders.Set("Version", "0.130.0")
+
+	applyCodexRequestHeaders(req, "gpt-5.5", "token", "acc-id", "session-123", identity, true, downstreamHeaders)
+
+	if got := req.Header.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty for gpt-5.5 even when downstream provided it", got)
 	}
 }

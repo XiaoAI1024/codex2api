@@ -355,7 +355,8 @@ func ExecuteRequestTraced(ctx context.Context, account *auth.Account, requestBod
 
 	// ==================== 请求头（对齐 CLIProxyAPI 的稳定策略） ====================
 	identity := resolveCodexRequestIdentity(account, apiKey, headers, deviceCfg)
-	applyCodexRequestHeaders(req, accessToken, accountID, cacheKey, identity, upstreamRequestWantsStream(requestBody), headers)
+	requestModel := strings.TrimSpace(gjson.GetBytes(requestBody, "model").String())
+	applyCodexRequestHeaders(req, requestModel, accessToken, accountID, cacheKey, identity, upstreamRequestWantsStream(requestBody), headers)
 
 	// 获取连接池 HTTP 客户端（账号级隔离，复用 TCP/TLS 连接）
 	client := getPooledClient(account, proxyURL)
