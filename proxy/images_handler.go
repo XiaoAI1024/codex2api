@@ -210,8 +210,14 @@ func normalizeImageInput(raw string) string {
 func buildImagesRequest(rawBody []byte, prompt string, images []string, imageModel string, action string) []byte {
 	body := []byte(`{}`)
 	body, _ = sjson.SetBytes(body, "model", defaultImagesMainModel)
+	body, _ = sjson.SetBytes(body, "instructions", "")
 	body, _ = sjson.SetBytes(body, "stream", true)
 	body, _ = sjson.SetBytes(body, "store", false)
+	body, _ = sjson.SetBytes(body, "parallel_tool_calls", true)
+	body, _ = sjson.SetBytes(body, "include", []string{"reasoning.encrypted_content"})
+	body, _ = sjson.SetBytes(body, "reasoning.effort", "medium")
+	body, _ = sjson.SetBytes(body, "reasoning.summary", "auto")
+	body, _ = sjson.SetBytes(body, "tool_choice.type", "image_generation")
 
 	tool := []byte(`{"type":"image_generation"}`)
 	tool, _ = sjson.SetBytes(tool, "action", action)

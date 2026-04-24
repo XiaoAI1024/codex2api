@@ -14,6 +14,30 @@ func TestBuildImagesRequest_Generation(t *testing.T) {
 	if got := gjson.GetBytes(body, "model").String(); got != defaultImagesMainModel {
 		t.Fatalf("model mismatch: %q", got)
 	}
+	if got := gjson.GetBytes(body, "instructions").String(); got != "" {
+		t.Fatalf("instructions mismatch: %q", got)
+	}
+	if got := gjson.GetBytes(body, "stream").Bool(); !got {
+		t.Fatalf("stream mismatch: %v", got)
+	}
+	if got := gjson.GetBytes(body, "store").Bool(); got {
+		t.Fatalf("store mismatch: %v", got)
+	}
+	if got := gjson.GetBytes(body, "parallel_tool_calls").Bool(); !got {
+		t.Fatalf("parallel_tool_calls mismatch: %v", got)
+	}
+	if got := gjson.GetBytes(body, "include.0").String(); got != "reasoning.encrypted_content" {
+		t.Fatalf("include mismatch: %q", got)
+	}
+	if got := gjson.GetBytes(body, "reasoning.effort").String(); got != "medium" {
+		t.Fatalf("reasoning.effort mismatch: %q", got)
+	}
+	if got := gjson.GetBytes(body, "reasoning.summary").String(); got != "auto" {
+		t.Fatalf("reasoning.summary mismatch: %q", got)
+	}
+	if got := gjson.GetBytes(body, "tool_choice.type").String(); got != "image_generation" {
+		t.Fatalf("tool_choice.type mismatch: %q", got)
+	}
 	if got := gjson.GetBytes(body, "tools.0.type").String(); got != "image_generation" {
 		t.Fatalf("tool type mismatch: %q", got)
 	}
