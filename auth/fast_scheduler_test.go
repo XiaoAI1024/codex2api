@@ -17,6 +17,40 @@ func newFastSchedulerTestAccount(id int64, tier AccountHealthTier, score float64
 	}
 }
 
+func assertFastSchedulerBucketOrder(t *testing.T, scheduler *FastScheduler, tier AccountHealthTier, want []int64) {
+	t.Helper()
+
+	scheduler.mu.RLock()
+	defer scheduler.mu.RUnlock()
+
+	bucket := scheduler.buckets[tier]
+	if len(bucket) != len(want) {
+		t.Fatalf("bucket %v len=%d, want %d", tier, len(bucket), len(want))
+	}
+	for i, dbID := range want {
+		if bucket[i].dbID != dbID {
+			t.Fatalf("bucket %v order mismatch at %d: got=%d want=%d full=%v", tier, i, bucket[i].dbID, dbID, bucket)
+		}
+	}
+}
+
+func assertFastSchedulerPositions(t *testing.T, scheduler *FastScheduler, tier AccountHealthTier, want []int64) {
+	t.Helper()
+
+	scheduler.mu.RLock()
+	defer scheduler.mu.RUnlock()
+
+	for index, dbID := range want {
+		pos, ok := scheduler.positions[dbID]
+		if !ok {
+			t.Fatalf("positions[%d] missing", dbID)
+		}
+		if pos.tier != tier || pos.index != index {
+			t.Fatalf("positions[%d]=%+v, want tier=%v index=%d", dbID, pos, tier, index)
+		}
+	}
+}
+
 func TestFastSchedulerAcquirePrefersHealthyTier(t *testing.T) {
 	warm := newFastSchedulerTestAccount(1, HealthTierWarm, 90, 2)
 	healthy := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 2)
@@ -157,6 +191,174 @@ func TestFastSchedulerUpdateMovesAccountBetweenBuckets(t *testing.T) {
 	if sizes[HealthTierWarm] != 1 {
 		t.Fatalf("warm bucket size = %d, want 1", sizes[HealthTierWarm])
 	}
+}
+
+func TestFastSchedulerFindInsertIndexOrdersByScoreAndDBID(t *testing.T) {
+	entries := []fastSchedulerEntry{
+		{dbID: 1, score: 120},
+		{dbID: 3, score: 100},
+		{dbID: 5, score: 100},
+		{dbID: 7, score: 80},
+	}
+
+	tests := []struct {
+		name  string
+		entry fastSchedulerEntry
+		want  int
+	}{
+		{
+			name:  "higher score goes first",
+			entry: fastSchedulerEntry{dbID: 9, score: 130},
+			want:  0,
+		},
+		{
+			name:  "same score lower dbid goes earlier",
+			entry: fastSchedulerEntry{dbID: 2, score: 100},
+			want:  1,
+		},
+		{
+			name:  "same score higher dbid goes later",
+			entry: fastSchedulerEntry{dbID: 6, score: 100},
+			want:  3,
+		},
+		{
+			name:  "lower score goes last",
+			entry: fastSchedulerEntry{dbID: 8, score: 70},
+			want:  4,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := findFastSchedulerInsertIndex(entries, tt.entry); got != tt.want {
+				t.Fatalf("findFastSchedulerInsertIndex(...)=%d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFastSchedulerUpdateReordersWithinBucketAndRefreshesPositions(t *testing.T) {
+	acc1 := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 2)
+	acc2 := newFastSchedulerTestAccount(2, HealthTierHealthy, 110, 2)
+	acc3 := newFastSchedulerTestAccount(3, HealthTierHealthy, 100, 2)
+
+	scheduler := NewFastScheduler(2, "", 0)
+	scheduler.Rebuild([]*Account{acc1, acc2, acc3})
+
+	assertFastSchedulerBucketOrder(t, scheduler, HealthTierHealthy, []int64{1, 2, 3})
+	assertFastSchedulerPositions(t, scheduler, HealthTierHealthy, []int64{1, 2, 3})
+
+	acc3.mu.Lock()
+	acc3.SchedulerScore = 115
+	acc3.mu.Unlock()
+	scheduler.Update(acc3)
+
+	assertFastSchedulerBucketOrder(t, scheduler, HealthTierHealthy, []int64{1, 3, 2})
+	assertFastSchedulerPositions(t, scheduler, HealthTierHealthy, []int64{1, 3, 2})
+
+	acc1.mu.Lock()
+	acc1.SchedulerScore = 90
+	acc1.mu.Unlock()
+	scheduler.Update(acc1)
+
+	assertFastSchedulerBucketOrder(t, scheduler, HealthTierHealthy, []int64{3, 2, 1})
+	assertFastSchedulerPositions(t, scheduler, HealthTierHealthy, []int64{3, 2, 1})
+}
+
+func TestFastSchedulerUpdateMovesBetweenBucketsAndRefreshesPositions(t *testing.T) {
+	acc1 := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 2)
+	acc2 := newFastSchedulerTestAccount(2, HealthTierHealthy, 100, 2)
+	acc3 := newFastSchedulerTestAccount(3, HealthTierWarm, 90, 2)
+
+	scheduler := NewFastScheduler(2, "", 0)
+	scheduler.Rebuild([]*Account{acc1, acc2, acc3})
+
+	acc2.mu.Lock()
+	acc2.HealthTier = HealthTierWarm
+	acc2.SchedulerScore = 95
+	acc2.mu.Unlock()
+	scheduler.Update(acc2)
+
+	assertFastSchedulerBucketOrder(t, scheduler, HealthTierHealthy, []int64{1})
+	assertFastSchedulerBucketOrder(t, scheduler, HealthTierWarm, []int64{2, 3})
+	assertFastSchedulerPositions(t, scheduler, HealthTierHealthy, []int64{1})
+	assertFastSchedulerPositions(t, scheduler, HealthTierWarm, []int64{2, 3})
+}
+
+func TestFastSchedulerUpdateRemovesUnavailableAccountAndRefreshesPositions(t *testing.T) {
+	acc1 := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 2)
+	acc2 := newFastSchedulerTestAccount(2, HealthTierHealthy, 110, 2)
+	acc3 := newFastSchedulerTestAccount(3, HealthTierHealthy, 100, 2)
+
+	scheduler := NewFastScheduler(2, "", 0)
+	scheduler.Rebuild([]*Account{acc1, acc2, acc3})
+
+	acc2.mu.Lock()
+	acc2.AccessToken = ""
+	acc2.mu.Unlock()
+	scheduler.Update(acc2)
+
+	assertFastSchedulerBucketOrder(t, scheduler, HealthTierHealthy, []int64{1, 3})
+	assertFastSchedulerPositions(t, scheduler, HealthTierHealthy, []int64{1, 3})
+
+	scheduler.mu.RLock()
+	_, ok := scheduler.positions[acc2.DBID]
+	scheduler.mu.RUnlock()
+	if ok {
+		t.Fatalf("positions[%d] still exists after removal", acc2.DBID)
+	}
+}
+
+func TestFastSchedulerUpdateRepairsStalePositionIndex(t *testing.T) {
+	acc1 := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 2)
+	acc2 := newFastSchedulerTestAccount(2, HealthTierHealthy, 110, 2)
+	acc3 := newFastSchedulerTestAccount(3, HealthTierHealthy, 100, 2)
+
+	scheduler := NewFastScheduler(2, "", 0)
+	scheduler.Rebuild([]*Account{acc1, acc2, acc3})
+
+	scheduler.mu.Lock()
+	scheduler.positions[acc3.DBID] = fastSchedulerPosition{tier: HealthTierHealthy, index: 0}
+	scheduler.mu.Unlock()
+
+	acc3.mu.Lock()
+	acc3.SchedulerScore = 115
+	acc3.mu.Unlock()
+	scheduler.Update(acc3)
+
+	assertFastSchedulerBucketOrder(t, scheduler, HealthTierHealthy, []int64{1, 3, 2})
+	assertFastSchedulerPositions(t, scheduler, HealthTierHealthy, []int64{1, 3, 2})
+}
+
+func TestFastSchedulerUpdateMaintainsTieBreakAndProvenBounds(t *testing.T) {
+	acc1 := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 2)
+	acc3 := newFastSchedulerTestAccount(3, HealthTierHealthy, 110, 2)
+	acc5 := newFastSchedulerTestAccount(5, HealthTierHealthy, 100, 2)
+
+	scheduler := NewFastScheduler(2, "", 0)
+	scheduler.Rebuild([]*Account{acc1, acc3, acc5})
+
+	scheduler.mu.RLock()
+	if got := scheduler.provenBounds[0]; got != 2 {
+		scheduler.mu.RUnlock()
+		t.Fatalf("healthy proven bound = %d, want %d", got, 2)
+	}
+	scheduler.mu.RUnlock()
+
+	acc5.mu.Lock()
+	acc5.SchedulerScore = 110
+	acc5.mu.Unlock()
+	scheduler.Update(acc5)
+
+	assertFastSchedulerBucketOrder(t, scheduler, HealthTierHealthy, []int64{1, 3, 5})
+	assertFastSchedulerPositions(t, scheduler, HealthTierHealthy, []int64{1, 3, 5})
+
+	scheduler.mu.RLock()
+	if got := scheduler.provenBounds[0]; got != 3 {
+		scheduler.mu.RUnlock()
+		t.Fatalf("healthy proven bound = %d, want %d", got, 3)
+	}
+	scheduler.mu.RUnlock()
 }
 
 func TestFastSchedulerSkipsStaleBucketEntryWithoutUpdate(t *testing.T) {

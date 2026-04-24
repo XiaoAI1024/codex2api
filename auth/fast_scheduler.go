@@ -151,8 +151,7 @@ func (s *FastScheduler) Update(acc *Account) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.removeLocked(acc.DBID)
-	s.insertLocked(acc, time.Now())
+	s.updateLocked(acc, time.Now())
 }
 
 func (s *FastScheduler) Remove(dbID int64) {
@@ -316,64 +315,186 @@ func (s *FastScheduler) BucketSizes() map[AccountHealthTier]int {
 }
 
 func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
-	if acc == nil || acc.DBID == 0 {
+	entry, tier, ok := s.snapshotEntryLocked(acc, now)
+	if !ok {
 		return
+	}
+	s.insertEntryLocked(tier, entry)
+}
+
+func (s *FastScheduler) updateLocked(acc *Account, now time.Time) {
+	entry, tier, available := s.snapshotEntryLocked(acc, now)
+	pos, exists := s.locatePositionLocked(acc.DBID)
+
+	if !available {
+		if exists {
+			s.removeEntryAtLocked(pos.tier, pos.index)
+		}
+		return
+	}
+
+	if !exists {
+		s.insertEntryLocked(tier, entry)
+		return
+	}
+
+	if pos.tier != tier {
+		s.removeEntryAtLocked(pos.tier, pos.index)
+		s.insertEntryLocked(tier, entry)
+		return
+	}
+
+	s.repositionEntryLocked(tier, pos.index, entry)
+}
+
+func (s *FastScheduler) snapshotEntryLocked(acc *Account, now time.Time) (fastSchedulerEntry, AccountHealthTier, bool) {
+	if acc == nil || acc.DBID == 0 {
+		return fastSchedulerEntry{}, "", false
 	}
 
 	tier, score, limit, available := acc.fastSchedulerSnapshot(s.baseLimit, now)
 	if !available || limit <= 0 {
-		return
+		return fastSchedulerEntry{}, tier, false
 	}
 	if tier != HealthTierHealthy && tier != HealthTierWarm && tier != HealthTierRisky {
-		return
+		return fastSchedulerEntry{}, tier, false
 	}
-	score += s.planBonusForAccount(acc)
 
-	entries := append(s.buckets[tier], fastSchedulerEntry{
+	return fastSchedulerEntry{
 		acc:       acc,
 		dbID:      acc.DBID,
-		score:     score,
+		score:     score + s.planBonusForAccount(acc),
 		preferred: s.isPreferredAccount(acc),
-	})
-	sort.SliceStable(entries, func(i, j int) bool {
-		if entries[i].score == entries[j].score {
-			return entries[i].dbID < entries[j].dbID
+	}, tier, true
+}
+
+func (s *FastScheduler) removeLocked(dbID int64) {
+	pos, ok := s.locatePositionLocked(dbID)
+	if !ok {
+		return
+	}
+	s.removeEntryAtLocked(pos.tier, pos.index)
+}
+
+func (s *FastScheduler) locatePositionLocked(dbID int64) (fastSchedulerPosition, bool) {
+	pos, ok := s.positions[dbID]
+	if ok {
+		entries := s.buckets[pos.tier]
+		if pos.index >= 0 && pos.index < len(entries) && entries[pos.index].dbID == dbID {
+			return pos, true
 		}
-		return entries[i].score > entries[j].score
+	}
+
+	for _, tier := range fastSchedulerTierOrder {
+		entries := s.buckets[tier]
+		for idx, entry := range entries {
+			if entry.dbID == dbID {
+				pos = fastSchedulerPosition{
+					tier:  tier,
+					index: idx,
+				}
+				s.positions[dbID] = pos
+				return pos, true
+			}
+		}
+	}
+
+	delete(s.positions, dbID)
+	return fastSchedulerPosition{}, false
+}
+
+func fastSchedulerEntryLess(a, b fastSchedulerEntry) bool {
+	if a.score == b.score {
+		return a.dbID < b.dbID
+	}
+	return a.score > b.score
+}
+
+func findFastSchedulerInsertIndex(entries []fastSchedulerEntry, entry fastSchedulerEntry) int {
+	return sort.Search(len(entries), func(i int) bool {
+		return !fastSchedulerEntryLess(entries[i], entry)
 	})
+}
+
+func (s *FastScheduler) insertEntryLocked(tier AccountHealthTier, entry fastSchedulerEntry) {
+	entries := s.buckets[tier]
+	index := findFastSchedulerInsertIndex(entries, entry)
+
+	entries = append(entries, fastSchedulerEntry{})
+	copy(entries[index+1:], entries[index:])
+	entries[index] = entry
 	s.buckets[tier] = entries
-	s.rebuildPositionsLocked(tier)
-	// 更新该 tier 的验证账号边界
-	for tierIdx, t := range fastSchedulerTierOrder {
-		if t == tier {
-			s.provenBounds[tierIdx] = countProvenEntries(entries)
-			break
+	s.refreshPositionsFromLocked(tier, index)
+	s.updateProvenBoundLocked(tier)
+}
+
+func (s *FastScheduler) removeEntryAtLocked(tier AccountHealthTier, index int) {
+	entries := s.buckets[tier]
+	if index < 0 || index >= len(entries) {
+		return
+	}
+
+	dbID := entries[index].dbID
+	copy(entries[index:], entries[index+1:])
+	entries = entries[:len(entries)-1]
+	s.buckets[tier] = entries
+	delete(s.positions, dbID)
+	s.refreshPositionsFromLocked(tier, index)
+	s.updateProvenBoundLocked(tier)
+}
+
+func (s *FastScheduler) repositionEntryLocked(tier AccountHealthTier, index int, entry fastSchedulerEntry) {
+	entries := s.buckets[tier]
+	if index < 0 || index >= len(entries) {
+		s.insertEntryLocked(tier, entry)
+		return
+	}
+
+	current := index
+	for current > 0 && fastSchedulerEntryLess(entry, entries[current-1]) {
+		entries[current] = entries[current-1]
+		s.positions[entries[current].dbID] = fastSchedulerPosition{
+			tier:  tier,
+			index: current,
+		}
+		current--
+	}
+	for current < len(entries)-1 && fastSchedulerEntryLess(entries[current+1], entry) {
+		entries[current] = entries[current+1]
+		s.positions[entries[current].dbID] = fastSchedulerPosition{
+			tier:  tier,
+			index: current,
+		}
+		current++
+	}
+
+	entries[current] = entry
+	s.positions[entry.dbID] = fastSchedulerPosition{
+		tier:  tier,
+		index: current,
+	}
+	s.buckets[tier] = entries
+	s.updateProvenBoundLocked(tier)
+}
+
+func (s *FastScheduler) refreshPositionsFromLocked(tier AccountHealthTier, start int) {
+	if start < 0 {
+		start = 0
+	}
+	entries := s.buckets[tier]
+	for idx := start; idx < len(entries); idx++ {
+		s.positions[entries[idx].dbID] = fastSchedulerPosition{
+			tier:  tier,
+			index: idx,
 		}
 	}
 }
 
-func (s *FastScheduler) removeLocked(dbID int64) {
-	pos, ok := s.positions[dbID]
-	if !ok {
-		return
-	}
-
-	entries := s.buckets[pos.tier]
-	if pos.index < 0 || pos.index >= len(entries) {
-		delete(s.positions, dbID)
-		return
-	}
-
-	copy(entries[pos.index:], entries[pos.index+1:])
-	entries = entries[:len(entries)-1]
-	s.buckets[pos.tier] = entries
-	delete(s.positions, dbID)
-	s.rebuildPositionsLocked(pos.tier)
-	// 更新该 tier 的验证账号边界
-	for tierIdx, t := range fastSchedulerTierOrder {
-		if t == pos.tier {
-			s.provenBounds[tierIdx] = countProvenEntries(entries)
-			break
+func (s *FastScheduler) updateProvenBoundLocked(tier AccountHealthTier) {
+	for tierIdx, currentTier := range fastSchedulerTierOrder {
+		if currentTier == tier {
+			s.provenBounds[tierIdx] = countProvenEntries(s.buckets[tier])
+			return
 		}
 	}
 }
