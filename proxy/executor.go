@@ -253,6 +253,14 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	return resp, err
 }
 
+func upstreamRequestWantsStream(requestBody []byte) bool {
+	stream := gjson.GetBytes(requestBody, "stream")
+	if !stream.Exists() {
+		return true
+	}
+	return stream.Bool()
+}
+
 func ExecuteRequestTraced(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, useWebsocket ...bool) (*http.Response, *UpstreamAttemptTrace, error) {
 	// 检查是否使用 WebSocket
 	if ctx == nil {
@@ -347,7 +355,7 @@ func ExecuteRequestTraced(ctx context.Context, account *auth.Account, requestBod
 
 	// ==================== 请求头（对齐 CLIProxyAPI 的稳定策略） ====================
 	identity := resolveCodexRequestIdentity(account, apiKey, headers, deviceCfg)
-	applyCodexRequestHeaders(req, accessToken, accountID, cacheKey, identity, true, headers)
+	applyCodexRequestHeaders(req, accessToken, accountID, cacheKey, identity, upstreamRequestWantsStream(requestBody), headers)
 
 	// 获取连接池 HTTP 客户端（账号级隔离，复用 TCP/TLS 连接）
 	client := getPooledClient(account, proxyURL)
