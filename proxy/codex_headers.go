@@ -97,9 +97,8 @@ func applyCodexRequestHeaders(req *http.Request, accessToken, accountID, session
 	if identity.UserAgent != "" {
 		req.Header.Set("User-Agent", identity.UserAgent)
 	}
-	if identity.Version != "" {
-		req.Header.Set("Version", identity.Version)
-	}
+	// 对齐 CLIProxyAPI：默认不主动合成 Version 请求头，仅在下游显式传入时透传。
+	ensureHeader(req.Header, downstreamHeaders, "Version", "")
 
 	ensureHeader(req.Header, downstreamHeaders, "X-Codex-Turn-Metadata", "")
 	ensureHeader(req.Header, downstreamHeaders, "X-Codex-Turn-State", "")

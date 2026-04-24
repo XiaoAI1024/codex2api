@@ -200,14 +200,13 @@ func (e *Executor) prepareWebsocketHeaders(
 	}
 	headers.Set("OpenAI-Beta", betaHeader)
 
-	// 对齐 HTTP 链路：统一的 UA/Version 解析策略（稳定化 + 可学习）。
-	userAgent, version := proxy.ResolveCodexHeaderIdentity(account, apiKey, downstreamHeaders, deviceCfg)
+	// 对齐 HTTP 链路：统一的 UA 解析策略（稳定化 + 可学习）。
+	userAgent, _ := proxy.ResolveCodexHeaderIdentity(account, apiKey, downstreamHeaders, deviceCfg)
 	if strings.TrimSpace(userAgent) != "" {
 		headers.Set("User-Agent", strings.TrimSpace(userAgent))
 	}
-	if strings.TrimSpace(version) != "" {
-		headers.Set("Version", strings.TrimSpace(version))
-	}
+	// 对齐 CLIProxyAPI：默认不主动合成 Version 请求头，仅在下游显式传入时透传。
+	ensureWebsocketHeader(headers, downstreamHeaders, "Version", "")
 
 	ensureWebsocketHeader(headers, downstreamHeaders, "Session_id", uuid.NewString())
 	ensureWebsocketHeader(headers, downstreamHeaders, "X-Client-Request-Id", uuid.NewString())
