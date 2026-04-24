@@ -120,6 +120,10 @@ func codexResponseFailedMessage(data []byte) string {
 	if errMsg != "" {
 		return errMsg
 	}
+	errMsg = strings.TrimSpace(gjson.GetBytes(data, "response.error.message").String())
+	if errMsg != "" {
+		return errMsg
+	}
 	errMsg = strings.TrimSpace(gjson.GetBytes(data, "error.message").String())
 	if errMsg != "" {
 		return errMsg

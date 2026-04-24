@@ -61,3 +61,30 @@ func TestCodexTextCollectorDoesNotDuplicateAfterDelta(t *testing.T) {
 		t.Fatal("expected collector to report content after delta")
 	}
 }
+
+func TestCodexResponseFailedMessageUsesNestedResponseError(t *testing.T) {
+	got := codexResponseFailedMessage([]byte(`{"type":"response.failed","response":{"error":{"code":"model_not_found","message":"The model ` + "`gpt-5.5`" + ` does not exist or you do not have access to it."}}}`))
+	want := "The model `gpt-5.5` does not exist or you do not have access to it."
+	if got != want {
+		t.Fatalf("codexResponseFailedMessage() = %q, want %q", got, want)
+	}
+}
+
+func TestCodexResponseFailedMessagePrefersStatusDetails(t *testing.T) {
+	got := codexResponseFailedMessage([]byte(`{"type":"response.failed","response":{"status_details":{"error":{"message":"status details"}},"error":{"message":"nested response"}},"error":{"message":"root"}}`))
+	if got != "status details" {
+		t.Fatalf("codexResponseFailedMessage() = %q, want %q", got, "status details")
+	}
+}
+
+func TestCodexResponseFailedMessageFallsBackToRootErrorAndDefault(t *testing.T) {
+	got := codexResponseFailedMessage([]byte(`{"type":"response.failed","response":{"error":{"message":" "}},"error":{"message":"root"}}`))
+	if got != "root" {
+		t.Fatalf("codexResponseFailedMessage() = %q, want %q", got, "root")
+	}
+
+	got = codexResponseFailedMessage([]byte(`{"type":"response.failed","response":{"error":{"message":" "}},"error":{"message":" "}}`))
+	if got != "上游返回 response.failed" {
+		t.Fatalf("codexResponseFailedMessage() = %q, want default", got)
+	}
+}
