@@ -1,16 +1,22 @@
 package proxy
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"mime"
+	"mime/multipart"
 	"net/http"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/codex2api/api"
+	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
@@ -30,6 +36,16 @@ type imageCallResult struct {
 	Size          string
 	Background    string
 	Quality       string
+}
+
+type imagesEditRequest struct {
+	rawBody        []byte
+	prompt         string
+	imageModel     string
+	responseFormat string
+	images         []string
+	mask           string
+	stream         bool
 }
 
 // ImagesGenerations 处理 /v1/images/generations。
@@ -84,18 +100,20 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 	}
 
 	codexBody := buildImagesRequest(rawBody, prompt, nil, imageModel, "generate")
-	h.executeImageEndpoint(c, "/v1/images/generations", imageModel, responseFormat, codexBody)
+	h.executeImageEndpoint(c, "/v1/images/generations", imageModel, responseFormat, codexBody, gjson.GetBytes(rawBody, "stream").Bool(), "image_generation")
 }
 
-// ImagesEdits 处理 /v1/images/edits（当前支持 JSON 请求）。
+// ImagesEdits 处理 /v1/images/edits。
 func (h *Handler) ImagesEdits(c *gin.Context) {
 	contentType := strings.ToLower(strings.TrimSpace(c.GetHeader("Content-Type")))
 	if strings.HasPrefix(contentType, "multipart/form-data") {
-		api.SendError(c, api.NewAPIError(
-			api.ErrCodeInvalidRequest,
-			"multipart/form-data is not supported yet for /v1/images/edits, please send application/json",
-			api.ErrorTypeInvalidRequest,
-		))
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, int64(security.MaxRequestBodySize))
+		parsed, err := parseMultipartImagesEditRequest(c.Request)
+		if err != nil {
+			api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Invalid multipart request: "+err.Error(), api.ErrorTypeInvalidRequest))
+			return
+		}
+		h.handleParsedImagesEdit(c, parsed)
 		return
 	}
 	if contentType != "" && !strings.HasPrefix(contentType, "application/json") {
@@ -123,32 +141,57 @@ func (h *Handler) ImagesEdits(c *gin.Context) {
 		return
 	}
 
-	prompt := strings.TrimSpace(gjson.GetBytes(rawBody, "prompt").String())
-	if prompt == "" {
+	parsed, err := parseJSONImagesEditRequest(rawBody)
+	if err != nil {
+		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, err.Error(), api.ErrorTypeInvalidRequest))
+		return
+	}
+	h.handleParsedImagesEdit(c, parsed)
+}
+
+func (h *Handler) handleParsedImagesEdit(c *gin.Context, parsed imagesEditRequest) {
+	if parsed.prompt == "" {
 		api.SendMissingFieldError(c, "prompt")
 		return
 	}
-
-	imageModel := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
-	if imageModel == "" {
-		imageModel = defaultImagesToolModel
-	}
-	if !SupportsImageRequests(imageModel) {
+	if !SupportsImageRequests(parsed.imageModel) {
 		api.SendError(c, api.NewAPIError(
 			api.ErrCodeUnsupportedModel,
-			fmt.Sprintf("model '%s' is not supported on image endpoints", imageModel),
+			fmt.Sprintf("model '%s' is not supported on image endpoints", parsed.imageModel),
 			api.ErrorTypeInvalidRequest,
 		))
 		return
 	}
+	if parsed.responseFormat != "b64_json" && parsed.responseFormat != "url" {
+		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, "response_format must be one of: b64_json, url", api.ErrorTypeInvalidRequest))
+		return
+	}
+	if len(parsed.images) == 0 {
+		api.SendMissingFieldError(c, "image")
+		return
+	}
+	rawBody := parsed.rawBody
+	if gjson.GetBytes(rawBody, "n").Exists() {
+		log.Printf("[images/edits] ignore unsupported n parameter")
+		rawBody, _ = sjson.DeleteBytes(rawBody, "n")
+	}
+	codexBody := buildImagesRequest(rawBody, parsed.prompt, parsed.images, parsed.imageModel, "edit")
+	h.executeImageEndpoint(c, "/v1/images/edits", parsed.imageModel, parsed.responseFormat, codexBody, parsed.stream, "image_edit")
+}
 
+func parseJSONImagesEditRequest(rawBody []byte) (imagesEditRequest, error) {
+	prompt := strings.TrimSpace(gjson.GetBytes(rawBody, "prompt").String())
+	imageModel := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+	if imageModel == "" {
+		imageModel = defaultImagesToolModel
+	}
 	responseFormat := strings.ToLower(strings.TrimSpace(gjson.GetBytes(rawBody, "response_format").String()))
 	if responseFormat == "" {
 		responseFormat = "b64_json"
 	}
-	if responseFormat != "b64_json" && responseFormat != "url" {
-		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, "response_format must be one of: b64_json, url", api.ErrorTypeInvalidRequest))
-		return
+
+	if gjson.GetBytes(rawBody, "mask.file_id").Exists() {
+		return imagesEditRequest{}, fmt.Errorf("mask.file_id is not supported, use mask.image_url instead")
 	}
 
 	var images []string
@@ -182,18 +225,141 @@ func (h *Handler) ImagesEdits(c *gin.Context) {
 		}
 		collectImage(v)
 	}
-	if len(images) == 0 {
-		api.SendMissingFieldError(c, "image")
-		return
+
+	if mask := strings.TrimSpace(gjson.GetBytes(rawBody, "mask.image_url").String()); mask != "" {
+		rawBody, _ = sjson.SetBytes(rawBody, "mask.image_url", normalizeImageInput(mask))
+	} else if mask := strings.TrimSpace(gjson.GetBytes(rawBody, "mask").String()); mask != "" {
+		rawBody, _ = sjson.SetBytes(rawBody, "mask.image_url", normalizeImageInput(mask))
 	}
 
-	if gjson.GetBytes(rawBody, "n").Exists() {
-		log.Printf("[images/edits] ignore unsupported n parameter")
-		rawBody, _ = sjson.DeleteBytes(rawBody, "n")
+	return imagesEditRequest{
+		rawBody:        rawBody,
+		prompt:         prompt,
+		imageModel:     imageModel,
+		responseFormat: responseFormat,
+		images:         images,
+		stream:         gjson.GetBytes(rawBody, "stream").Bool(),
+	}, nil
+}
+
+func parseMultipartImagesEditRequest(r *http.Request) (imagesEditRequest, error) {
+	if err := r.ParseMultipartForm(int64(security.MaxRequestBodySize)); err != nil {
+		return imagesEditRequest{}, err
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
 	}
 
-	codexBody := buildImagesRequest(rawBody, prompt, images, imageModel, "edit")
-	h.executeImageEndpoint(c, "/v1/images/edits", imageModel, responseFormat, codexBody)
+	prompt := strings.TrimSpace(r.FormValue("prompt"))
+	imageModel := strings.TrimSpace(r.FormValue("model"))
+	if imageModel == "" {
+		imageModel = defaultImagesToolModel
+	}
+	responseFormat := strings.ToLower(strings.TrimSpace(r.FormValue("response_format")))
+	if responseFormat == "" {
+		responseFormat = "b64_json"
+	}
+
+	var images []string
+	if r.MultipartForm != nil && r.MultipartForm.File != nil {
+		files := r.MultipartForm.File["image[]"]
+		if len(files) == 0 {
+			files = r.MultipartForm.File["image"]
+		}
+		for _, file := range files {
+			dataURL, err := multipartFileToDataURL(file)
+			if err != nil {
+				return imagesEditRequest{}, err
+			}
+			images = append(images, dataURL)
+		}
+	}
+
+	body := []byte(`{}`)
+	for _, field := range []string{"size", "quality", "background", "output_format", "input_fidelity", "moderation"} {
+		if value := strings.TrimSpace(r.FormValue(field)); value != "" {
+			body, _ = sjson.SetBytes(body, field, value)
+		}
+	}
+	for _, field := range []string{"output_compression", "partial_images"} {
+		if value := strings.TrimSpace(r.FormValue(field)); value != "" {
+			body, _ = sjson.SetBytes(body, field, parseIntField(value, 0))
+		}
+	}
+	if r.MultipartForm != nil && r.MultipartForm.File != nil {
+		if masks := r.MultipartForm.File["mask"]; len(masks) > 0 && masks[0] != nil {
+			dataURL, err := multipartFileToDataURL(masks[0])
+			if err != nil {
+				return imagesEditRequest{}, err
+			}
+			body, _ = sjson.SetBytes(body, "mask.image_url", dataURL)
+		}
+	}
+
+	return imagesEditRequest{
+		rawBody:        body,
+		prompt:         prompt,
+		imageModel:     imageModel,
+		responseFormat: responseFormat,
+		images:         images,
+		mask:           gjson.GetBytes(body, "mask.image_url").String(),
+		stream:         parseBoolField(r.FormValue("stream"), false),
+	}, nil
+}
+
+func multipartFileToDataURL(file *multipart.FileHeader) (string, error) {
+	if file == nil {
+		return "", fmt.Errorf("missing file")
+	}
+	f, err := file.Open()
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return "", err
+	}
+	contentType := strings.TrimSpace(file.Header.Get("Content-Type"))
+	if contentType == "" || contentType == "application/octet-stream" {
+		if ext := strings.TrimSpace(filepath.Ext(file.Filename)); ext != "" {
+			if byExt := strings.TrimSpace(mime.TypeByExtension(ext)); byExt != "" {
+				contentType = byExt
+			}
+		}
+	}
+	if contentType == "" || contentType == "application/octet-stream" {
+		contentType = http.DetectContentType(data)
+	}
+	return "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(data), nil
+}
+
+func parseIntField(value string, fallback int64) int64 {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func parseBoolField(value string, fallback bool) bool {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return fallback
+	}
+	switch value {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func normalizeImageInput(raw string) string {
@@ -222,12 +388,17 @@ func buildImagesRequest(rawBody []byte, prompt string, images []string, imageMod
 	tool := []byte(`{"type":"image_generation"}`)
 	tool, _ = sjson.SetBytes(tool, "action", action)
 	tool, _ = sjson.SetBytes(tool, "model", imageModel)
-	for _, field := range []string{"size", "quality", "background", "output_format", "output_compression", "moderation", "partial_images"} {
+	for _, field := range []string{"size", "quality", "background", "output_format", "output_compression", "moderation", "partial_images", "input_fidelity"} {
 		v := gjson.GetBytes(rawBody, field)
 		if !v.Exists() {
 			continue
 		}
 		tool, _ = sjson.SetRawBytes(tool, field, []byte(v.Raw))
+	}
+	if action == "edit" {
+		if mask := strings.TrimSpace(gjson.GetBytes(rawBody, "mask.image_url").String()); mask != "" {
+			tool, _ = sjson.SetBytes(tool, "input_image_mask.image_url", mask)
+		}
 	}
 	body, _ = sjson.SetRawBytes(body, "tools.0", tool)
 
@@ -248,9 +419,9 @@ func buildImagesRequest(rawBody []byte, prompt string, images []string, imageMod
 	return body
 }
 
-func (h *Handler) executeImageEndpoint(c *gin.Context, endpoint, imageModel, responseFormat string, codexBody []byte) {
+func (h *Handler) executeImageEndpoint(c *gin.Context, endpoint, imageModel, responseFormat string, codexBody []byte, stream bool, streamPrefix string) {
 	requestStartedAt := requestStartTime(c)
-	logRequestLifecycleStart(c, endpoint, imageModel, false, "")
+	logRequestLifecycleStart(c, endpoint, imageModel, stream, "")
 
 	maxRetries := h.getMaxRetries()
 	var lastErr error
@@ -298,6 +469,7 @@ func (h *Handler) executeImageEndpoint(c *gin.Context, endpoint, imageModel, res
 		if resp.StatusCode != http.StatusOK {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			h.persistUsageAndSettleFromResponse(account, resp)
 			h.applyCooldown(account, resp.StatusCode, errBody, resp)
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
@@ -310,8 +482,20 @@ func (h *Handler) executeImageEndpoint(c *gin.Context, endpoint, imageModel, res
 			return
 		}
 
+		if stream {
+			streamErr := h.forwardImageStream(c, resp.Body, responseFormat, streamPrefix, account, endpoint, imageModel, requestStartedAt, start)
+			resp.Body.Close()
+			h.persistUsageAndSettleFromResponse(account, resp)
+			h.store.Release(account)
+			if streamErr != nil {
+				return
+			}
+			return
+		}
+
 		completed, streamItems, failedMsg, readErr := collectCompletedImageEvent(resp.Body)
 		resp.Body.Close()
+		h.persistUsageAndSettleFromResponse(account, resp)
 		if readErr != nil {
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
@@ -446,6 +630,185 @@ func collectCompletedImageEvent(body io.Reader) ([]byte, []imageCallResult, stri
 	}
 	streamItems = append(streamItems, fallbackItems...)
 	return completedEvent, streamItems, "", nil
+}
+
+func (h *Handler) forwardImageStream(c *gin.Context, body io.Reader, responseFormat string, streamPrefix string, account *auth.Account, endpoint string, imageModel string, requestStartedAt time.Time, start time.Time) error {
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": gin.H{"message": "streaming not supported", "type": "server_error"},
+		})
+		return fmt.Errorf("streaming not supported")
+	}
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+
+	writeEvent := func(eventName string, payload []byte) error {
+		if eventName != "" {
+			if _, err := fmt.Fprintf(c.Writer, "event: %s\n", eventName); err != nil {
+				return err
+			}
+		}
+		if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", payload); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+
+	var usage *UsageInfo
+	var writeErr error
+	var readErr error
+	gotTerminal := false
+	wroteAny := false
+	firstFrameRecorded := false
+	itemsByIndex := make(map[int64]imageCallResult)
+	fallbackItems := make([]imageCallResult, 0, 2)
+
+	readErr = ReadSSEStream(body, func(data []byte) bool {
+		eventType := gjson.GetBytes(data, "type").String()
+		if !firstFrameRecorded {
+			firstFrameRecorded = true
+			logUpstreamFirstFrame(c, endpoint, 1, eventType, requestStartedAt, start)
+		}
+
+		switch eventType {
+		case "response.image_generation_call.partial_image":
+			b64 := strings.TrimSpace(gjson.GetBytes(data, "partial_image_b64").String())
+			if b64 == "" {
+				return true
+			}
+			eventName := streamPrefix + ".partial_image"
+			payload := buildImageStreamPayload(eventName, responseFormat, imageCallResult{
+				Result:       b64,
+				OutputFormat: strings.TrimSpace(gjson.GetBytes(data, "output_format").String()),
+			}, gjson.GetBytes(data, "partial_image_index").Int(), nil)
+			writeErr = writeEvent(eventName, payload)
+			wroteAny = true
+			return writeErr == nil
+		case "response.output_item.done":
+			item := gjson.GetBytes(data, "item")
+			if parsed, ok := parseImageCallResultFromItem(item); ok {
+				if idx := gjson.GetBytes(data, "output_index"); idx.Exists() {
+					itemsByIndex[idx.Int()] = parsed
+				} else {
+					fallbackItems = append(fallbackItems, parsed)
+				}
+			}
+		case "response.completed":
+			gotTerminal = true
+			usage = extractUsage(data)
+			results, _, usageRaw, _, err := extractImagesFromResponsesCompleted(data)
+			if err != nil {
+				writeErr = writeImageStreamError(writeEvent, http.StatusBadGateway, err.Error())
+				return false
+			}
+			if len(results) == 0 {
+				results = sortedImageStreamItems(itemsByIndex, fallbackItems)
+			}
+			if len(results) == 0 {
+				writeErr = writeImageStreamError(writeEvent, http.StatusBadGateway, "upstream did not return image output")
+				return false
+			}
+			eventName := streamPrefix + ".completed"
+			for _, img := range results {
+				payload := buildImageStreamPayload(eventName, responseFormat, img, 0, usageRaw)
+				if err := writeEvent(eventName, payload); err != nil {
+					writeErr = err
+					return false
+				}
+				wroteAny = true
+			}
+			return false
+		case "response.failed":
+			gotTerminal = true
+			msg := strings.TrimSpace(gjson.GetBytes(data, "response.error.message").String())
+			if msg == "" {
+				msg = "Codex upstream error"
+			}
+			writeErr = writeImageStreamError(writeEvent, http.StatusBadGateway, msg)
+			return false
+		}
+		return true
+	})
+
+	attemptDuration := int(time.Since(start).Milliseconds())
+	totalDuration := int(time.Since(requestStartedAt).Milliseconds())
+	outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+	if outcome.penalize {
+		recyclePooledClientForAccount(account)
+		h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(attemptDuration)*time.Millisecond)
+	} else if outcome.logStatusCode == http.StatusOK {
+		h.store.ReportRequestSuccess(account, schedulerLatency(attemptDuration, 0))
+	}
+	logInput := &database.UsageLogInput{
+		AccountID:        account.ID(),
+		Endpoint:         endpoint,
+		Model:            imageModel,
+		StatusCode:       outcome.logStatusCode,
+		DurationMs:       totalDuration,
+		InboundEndpoint:  endpoint,
+		UpstreamEndpoint: "/v1/responses",
+		Stream:           true,
+	}
+	if usage != nil {
+		logInput.PromptTokens = usage.PromptTokens
+		logInput.CompletionTokens = usage.CompletionTokens
+		logInput.TotalTokens = usage.TotalTokens
+		logInput.InputTokens = usage.InputTokens
+		logInput.OutputTokens = usage.OutputTokens
+		logInput.ReasoningTokens = usage.ReasoningTokens
+		logInput.CachedTokens = usage.CachedTokens
+	}
+	h.logUsage(logInput)
+	logUpstreamAttemptResult(c, endpoint, 1, account, "", outcome.logStatusCode, attemptDuration, requestStartedAt, "")
+
+	if writeErr != nil {
+		return writeErr
+	}
+	if readErr != nil {
+		if wroteAny {
+			_ = writeImageStreamError(writeEvent, http.StatusBadGateway, "upstream stream read failed: "+readErr.Error())
+			return readErr
+		}
+		return readErr
+	}
+	if !gotTerminal {
+		err := fmt.Errorf("upstream stream closed before response.completed")
+		if wroteAny {
+			_ = writeImageStreamError(writeEvent, http.StatusBadGateway, err.Error())
+		}
+		return err
+	}
+	return nil
+}
+
+func writeImageStreamError(writeEvent func(string, []byte) error, status int, message string) error {
+	payload := []byte(`{"error":{"message":"","type":"upstream_error"}}`)
+	payload, _ = sjson.SetBytes(payload, "error.message", message)
+	payload, _ = sjson.SetBytes(payload, "error.code", status)
+	return writeEvent("error", payload)
+}
+
+func sortedImageStreamItems(itemsByIndex map[int64]imageCallResult, fallbackItems []imageCallResult) []imageCallResult {
+	items := make([]imageCallResult, 0, len(itemsByIndex)+len(fallbackItems))
+	if len(itemsByIndex) > 0 {
+		indexes := make([]int64, 0, len(itemsByIndex))
+		for idx := range itemsByIndex {
+			indexes = append(indexes, idx)
+		}
+		sort.Slice(indexes, func(i, j int) bool {
+			return indexes[i] < indexes[j]
+		})
+		for _, idx := range indexes {
+			items = append(items, itemsByIndex[idx])
+		}
+	}
+	items = append(items, fallbackItems...)
+	return items
 }
 
 func parseImageCallResultFromItem(item gjson.Result) (imageCallResult, bool) {

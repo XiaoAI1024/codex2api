@@ -3,7 +3,6 @@ package wsrelay
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -207,9 +206,7 @@ func (e *Executor) prepareWebsocketHeaders(
 	if strings.TrimSpace(userAgent) != "" {
 		headers.Set("User-Agent", strings.TrimSpace(userAgent))
 	}
-	if !proxy.ShouldSuppressCodexVersionHeader(model) {
-		ensureWebsocketHeader(headers, downstreamHeaders, "Version", proxy.StableCodexVersion)
-	}
+	ensureWebsocketHeader(headers, downstreamHeaders, "Version", "")
 
 	ensureWebsocketHeader(headers, downstreamHeaders, "Session_id", uuid.NewString())
 	ensureWebsocketHeader(headers, downstreamHeaders, "X-Client-Request-Id", uuid.NewString())
@@ -233,20 +230,12 @@ func (e *Executor) prepareWebsocketHeaders(
 }
 
 // sendRequest 发送 WebSocket 请求
-func (e *Executor) sendRequest(wc *WsConnection, body []byte, requestID string) error {
+func (e *Executor) sendRequest(wc *WsConnection, body []byte, _ string) error {
 	if !wc.IsConnected() {
 		return fmt.Errorf("websocket connection is not connected")
 	}
 
-	// 构建消息
-	msg := NewHTTPRequestMessage(requestID, wc.session.ID, body)
-	msgBytes, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("marshal message failed: %w", err)
-	}
-
-	// 发送消息（使用 marshaled msgBytes）
-	return wc.WriteMessage(websocket.TextMessage, msgBytes)
+	return wc.WriteMessage(websocket.TextMessage, body)
 }
 
 // ==================== WebSocket 响应处理 ====================

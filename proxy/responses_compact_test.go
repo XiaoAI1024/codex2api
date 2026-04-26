@@ -70,6 +70,31 @@ func TestPrepareCompactRequestBodyNormalizesForUpstream(t *testing.T) {
 	}
 }
 
+func TestPrepareCompactRequestBodyNormalizesBuiltinToolsAndRoles(t *testing.T) {
+	body, _ := prepareCompactRequestBody([]byte(`{
+		"model":"gpt-5.4",
+		"input":[{"role":"system","content":"be terse"}],
+		"tools":[{"type":"web_search_preview"}],
+		"tool_choice":{
+			"type":"web_search_preview_2025_03_11",
+			"tools":[{"type":"web_search_preview"}]
+		}
+	}`), "gpt-5.4")
+
+	if got := gjson.GetBytes(body, "input.0.role").String(); got != "developer" {
+		t.Fatalf("input.0.role = %q, want developer; body=%s", got, string(body))
+	}
+	if got := gjson.GetBytes(body, "tools.0.type").String(); got != "web_search" {
+		t.Fatalf("tools.0.type = %q, want web_search; body=%s", got, string(body))
+	}
+	if got := gjson.GetBytes(body, "tool_choice.type").String(); got != "web_search" {
+		t.Fatalf("tool_choice.type = %q, want web_search; body=%s", got, string(body))
+	}
+	if got := gjson.GetBytes(body, "tool_choice.tools.0.type").String(); got != "web_search" {
+		t.Fatalf("tool_choice.tools.0.type = %q, want web_search; body=%s", got, string(body))
+	}
+}
+
 func TestExecuteRequestTracedToPathUsesCompactEndpoint(t *testing.T) {
 	var gotPath string
 	var gotBody []byte

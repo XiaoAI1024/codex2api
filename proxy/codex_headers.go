@@ -104,9 +104,7 @@ func applyCodexRequestHeaders(req *http.Request, model, accessToken, accountID, 
 	if identity.UserAgent != "" {
 		req.Header.Set("User-Agent", identity.UserAgent)
 	}
-	if !ShouldSuppressCodexVersionHeader(model) {
-		ensureHeader(req.Header, downstreamHeaders, "Version", identity.Version)
-	}
+	ensureHeader(req.Header, downstreamHeaders, "Version", "")
 
 	ensureHeader(req.Header, downstreamHeaders, "X-Codex-Turn-Metadata", "")
 	ensureHeader(req.Header, downstreamHeaders, "X-Codex-Turn-State", "")

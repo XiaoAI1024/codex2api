@@ -617,6 +617,7 @@ func (h *Handler) acquireAccountForRequest(c *gin.Context, exclude map[int64]boo
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	registerOpenAIRoutes := func(group *gin.RouterGroup) {
 		group.POST("/chat/completions", h.ChatCompletions)
+		group.GET("/responses", h.ResponsesWebsocket)
 		group.POST("/responses", h.Responses)
 		group.POST("/responses/compact", h.ResponsesCompact)
 		group.POST("/images/generations", h.ImagesGenerations)
@@ -638,6 +639,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	codexDirect := r.Group("/backend-api/codex")
 	codexDirect.Use(authMW)
 	{
+		codexDirect.GET("/responses", h.ResponsesWebsocket)
 		codexDirect.POST("/responses", h.Responses)
 		codexDirect.POST("/responses/compact", h.ResponsesCompact)
 	}
@@ -848,6 +850,7 @@ func prepareCompactRequestBody(rawBody []byte, model string) ([]byte, string) {
 			{"role": "user", "content": inputResult.String()},
 		})
 	}
+	body = normalizeCodexResponsesBody(body)
 
 	if re := gjson.GetBytes(body, "reasoning_effort"); re.Exists() && !gjson.GetBytes(body, "reasoning.effort").Exists() {
 		body, _ = sjson.SetBytes(body, "reasoning.effort", re.String())
@@ -857,6 +860,7 @@ func prepareCompactRequestBody(rawBody []byte, model string) ([]byte, string) {
 	body = sanitizeServiceTierForUpstream(body)
 	body = ensureToolDescriptions(body)
 	body = sanitizeToolSchemas(body)
+	body = normalizeCodexResponsesBody(body)
 
 	unsupportedFields := []string{
 		"max_output_tokens", "max_tokens", "max_completion_tokens",
@@ -981,7 +985,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 		downstreamHeaders := c.Request.Header.Clone()
 		sessionID := ResolveSessionID(c.GetHeader("Authorization"), rawBody)
-		resp, attemptTrace, reqErr := ExecuteRequestTracedToPath(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, "/responses/compact", false)
+		attemptBody := ensureImageGenerationTool(codexBody, model, account.GetPlanType())
+		resp, attemptTrace, reqErr := ExecuteRequestTracedToPath(c.Request.Context(), account, attemptBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, "/responses/compact", false)
 		durationMs := int(time.Since(start).Milliseconds())
 		upstreamStageMs += int64(durationMs)
 		c.Set("x-upstream-stage-ms", upstreamStageMs)
@@ -1174,6 +1179,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			{"role": "user", "content": inputResult.String()},
 		})
 	}
+	codexBody = normalizeCodexResponsesBody(codexBody)
 
 	// 将 Chat Completions 风格的 reasoning_effort 自动转换为 Responses API 的 reasoning.effort
 	if re := gjson.GetBytes(codexBody, "reasoning_effort"); re.Exists() && !gjson.GetBytes(codexBody, "reasoning.effort").Exists() {
@@ -1187,6 +1193,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	codexBody = ensureToolDescriptions(codexBody)
 	// 清理 function tool parameters 中上游不支持的 JSON Schema 关键字
 	codexBody = sanitizeToolSchemas(codexBody)
+	codexBody = normalizeCodexResponsesBody(codexBody)
 
 	// 展开 previous_response_id（将缓存的历史对话上下文注入 input）
 	codexBody, _ = expandPreviousResponse(codexBody)
@@ -1248,7 +1255,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
-		resp, attemptTrace, reqErr := ExecuteRequestTraced(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		attemptBody := ensureImageGenerationTool(codexBody, model, account.GetPlanType())
+		resp, attemptTrace, reqErr := ExecuteRequestTraced(c.Request.Context(), account, attemptBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 		upstreamStageMs += int64(durationMs)
 		c.Set("x-upstream-stage-ms", upstreamStageMs)

@@ -23,8 +23,8 @@ func TestPrepareWebsocketHeaders_DoesNotSetVersionByDefault(t *testing.T) {
 	if got := headers.Get("Authorization"); got != "Bearer token" {
 		t.Fatalf("Authorization = %q", got)
 	}
-	if got := headers.Get("Version"); got != proxy.StableCodexVersion {
-		t.Fatalf("Version = %q, want %q", got, proxy.StableCodexVersion)
+	if got := headers.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty by default", got)
 	}
 	if got := headers.Get("Chatgpt-Account-Id"); got != "acc-id" {
 		t.Fatalf("Chatgpt-Account-Id = %q", got)
@@ -72,7 +72,7 @@ func TestPrepareWebsocketHeaders_SuppressesVersionForGPT55ByDefault(t *testing.T
 	}
 }
 
-func TestPrepareWebsocketHeaders_SuppressesExplicitVersionForGPT55(t *testing.T) {
+func TestPrepareWebsocketHeaders_ForwardsExplicitVersionForGPT55(t *testing.T) {
 	exec := NewExecutor()
 	downstreamHeaders := http.Header{}
 	downstreamHeaders.Set("Version", "0.130.0")
@@ -87,7 +87,7 @@ func TestPrepareWebsocketHeaders_SuppressesExplicitVersionForGPT55(t *testing.T)
 		downstreamHeaders,
 	)
 
-	if got := headers.Get("Version"); got != "" {
-		t.Fatalf("Version = %q, want empty for gpt-5.5 even when downstream provided it", got)
+	if got := headers.Get("Version"); got != "0.130.0" {
+		t.Fatalf("Version = %q, want downstream header", got)
 	}
 }

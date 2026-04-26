@@ -11,6 +11,10 @@ info:
     - Administrative management interface
     - Request/response translation between OpenAI and Codex formats
     - Streaming and non-streaming chat completions
+    - Images generations/edits with JSON, multipart edits, and SSE streaming
+    - Responses WebSocket transport for Codex CLI compatibility
+    - Explicit-only Version header passthrough
+    - Responses builtin tool alias normalization
     - Function calling support
     - Tool calling support
   version: 1.0.0
@@ -23,14 +27,10 @@ info:
     url: https://opensource.org/licenses/MIT
 
 servers:
-  - url: http://localhost:8080/v1
-    description: Local development server (recommended versioned base URL)
-  - url: http://localhost:8080
-    description: Local development server (root-path compatibility base URL)
-  - url: https://api.codex2api.local/v1
-    description: Production server (recommended versioned base URL)
-  - url: https://api.codex2api.local
-    description: Production server (root-path compatibility base URL)
+  - url: http://example.com/v1
+    description: Versioned placeholder base URL
+  - url: http://example.com
+    description: Root-path placeholder base URL
 
 security:
   - BearerAuth: []
@@ -42,7 +42,30 @@ components:
       scheme: bearer
       description: |
         Enter your API key with Bearer prefix.
-        Example: "Bearer sk-..."
+        Example: "Bearer <API_KEY>"
+
+  parameters:
+    CodexVersionHeader:
+      name: Version
+      in: header
+      required: false
+      schema:
+        type: string
+        example: "<CODEX_CLI_VERSION>"
+      description: |
+        Optional Codex CLI Version header. Codex2API does not synthesize this
+        header by default; it is forwarded upstream only when explicitly sent by
+        the downstream client.
+    OpenAIBetaHeader:
+      name: OpenAI-Beta
+      in: header
+      required: false
+      schema:
+        type: string
+        example: "responses_websockets=2026-02-06"
+      description: |
+        Optional beta capability header. Responses WebSocket requests add the
+        required responses_websockets flag unless the client already sends one.
 
   schemas:
     Error:
@@ -334,10 +357,12 @@ components:
           type: string
           description: ID of the model to use
         input:
-          type: array
-          description: Input items for the response
-          items:
-            type: object
+          description: Input items or a plain string. Plain strings are wrapped as a user message.
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: object
         instructions:
           type: string
         max_output_tokens:
@@ -376,8 +401,31 @@ components:
           type: string
         tools:
           type: array
+          description: |
+            Responses tools. Built-in tool aliases are normalized before
+            upstream forwarding; for example web_search_preview and
+            web_search_preview_2025_03_11 become web_search.
+          items:
+            type: object
+            additionalProperties: true
         tool_choice:
-          type: object
+          description: Tool choice string or object. Built-in tool aliases under type/tools are normalized.
+          oneOf:
+            - type: string
+            - type: object
+              additionalProperties: true
+
+    ResponsesWebsocketMessage:
+      type: object
+      description: |
+        Text frame accepted by GET /responses WebSocket. The frame may be a
+        response.create envelope or a plain Responses request.
+      additionalProperties: true
+      example:
+        type: response.create
+        model: gpt-5.4
+        input: Hello from WebSocket
+        stream: true
 
     ResponsesResponse:
       type: object
@@ -447,6 +495,13 @@ components:
         moderation:
           type: string
           description: Moderation mode
+        partial_images:
+          type: integer
+          description: Number of partial image events requested for streaming responses
+        stream:
+          type: boolean
+          description: Return text/event-stream events when true
+          default: false
         n:
           type: integer
           description: Ignored for compatibility and not forwarded upstream
@@ -465,7 +520,7 @@ components:
           default: gpt-image-2
           example: gpt-image-2
         image:
-          description: Base image input (single string URL/data URL or array form)
+          description: Base image input (single URL, data URL, raw base64 string, object, or array form)
           oneOf:
             - type: string
             - type: array
@@ -489,7 +544,7 @@ components:
                   url:
                     type: string
         mask:
-          description: Optional mask image URL/data URL
+          description: Optional mask image URL/data URL/raw base64 or object. mask.file_id is not supported.
           oneOf:
             - type: string
             - type: object
@@ -521,13 +576,71 @@ components:
           description: Compression level for supported output formats
         input_fidelity:
           type: string
-          description: Input fidelity mode
+          description: Input fidelity mode forwarded to the image edit tool
+          enum: [low, high]
         moderation:
           type: string
           description: Moderation mode
+        partial_images:
+          type: integer
+          description: Number of partial image events requested for streaming responses
+        stream:
+          type: boolean
+          description: Return text/event-stream events when true
+          default: false
         n:
           type: integer
           description: Ignored for compatibility and not forwarded upstream
+
+    ImagesEditsMultipartRequest:
+      type: object
+      required:
+        - prompt
+      properties:
+        prompt:
+          type: string
+          description: Text prompt describing the desired edit result
+        model:
+          type: string
+          default: gpt-image-2
+        image:
+          type: string
+          format: binary
+          description: Input image file. Clients may also send repeated image[] parts.
+        image[]:
+          type: array
+          description: Repeated input image files
+          items:
+            type: string
+            format: binary
+        mask:
+          type: string
+          format: binary
+          description: Optional mask image file
+        response_format:
+          type: string
+          enum: [b64_json, url]
+          default: b64_json
+        size:
+          type: string
+        quality:
+          type: string
+        background:
+          type: string
+        output_format:
+          type: string
+        output_compression:
+          type: integer
+        input_fidelity:
+          type: string
+          enum: [low, high]
+        moderation:
+          type: string
+        partial_images:
+          type: integer
+        stream:
+          type: boolean
+          default: false
 
     ImageData:
       type: object
@@ -555,6 +668,29 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ImageData'
+
+    ImageStreamEvent:
+      type: object
+      properties:
+        type:
+          type: string
+          enum:
+            - image_generation.partial_image
+            - image_generation.completed
+            - image_edit.partial_image
+            - image_edit.completed
+        partial_image_index:
+          type: integer
+          description: Present on partial image events
+        b64_json:
+          type: string
+          description: Base64-encoded image data when response_format is b64_json
+        url:
+          type: string
+          description: Data URL when response_format is url
+        usage:
+          type: object
+          additionalProperties: true
 
 paths:
   /models:
@@ -646,14 +782,131 @@ paths:
                 $ref: '#/components/schemas/Error'
 
   /responses:
+    get:
+      summary: Connect Responses WebSocket
+      description: |
+        Codex CLI compatible Responses WebSocket transport. Clients connect with
+        WebSocket upgrade and send JSON text frames using either response.create
+        or a plain Responses API request. Upstream SSE events are forwarded back
+        to the client as WebSocket text frames.
+      operationId: connectResponsesWebsocket
+      tags:
+        - Responses
+      parameters:
+        - $ref: '#/components/parameters/CodexVersionHeader'
+        - $ref: '#/components/parameters/OpenAIBetaHeader'
+      responses:
+        '101':
+          description: WebSocket upgrade accepted
+        '400':
+          description: Invalid WebSocket request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     post:
       summary: Create response
       description: |
         Creates a response using the native Codex Responses API.
         Provides direct access to Codex functionality.
+        Built-in tool aliases are normalized before forwarding.
+        The Version header is forwarded only when the client explicitly sends it.
       operationId: createResponse
       tags:
         - Responses
+      parameters:
+        - $ref: '#/components/parameters/CodexVersionHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResponsesRequest'
+      responses:
+        '200':
+          description: Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResponsesResponse'
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /backend-api/codex/responses:
+    servers:
+      - url: http://example.com
+        description: Root-path placeholder base URL for Codex CLI direct compatibility
+    get:
+      summary: Connect Codex direct Responses WebSocket
+      description: |
+        Direct Codex CLI compatibility alias for GET /v1/responses. Uses
+        WebSocket upgrade and forwards Responses events as text frames.
+      operationId: connectBackendCodexResponsesWebsocket
+      tags:
+        - Responses
+      parameters:
+        - $ref: '#/components/parameters/CodexVersionHeader'
+        - $ref: '#/components/parameters/OpenAIBetaHeader'
+      responses:
+        '101':
+          description: WebSocket upgrade accepted
+        '400':
+          description: Invalid WebSocket request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    post:
+      summary: Create response through Codex direct route
+      description: Direct Codex CLI compatibility alias for POST /v1/responses.
+      operationId: createBackendCodexResponse
+      tags:
+        - Responses
+      parameters:
+        - $ref: '#/components/parameters/CodexVersionHeader'
       requestBody:
         required: true
         content:
@@ -713,6 +966,8 @@ paths:
       operationId: createResponseCompact
       tags:
         - Responses
+      parameters:
+        - $ref: '#/components/parameters/CodexVersionHeader'
       requestBody:
         required: true
         content:
@@ -766,9 +1021,13 @@ paths:
       description: |
         OpenAI-compatible images generation endpoint.
         Default model is `gpt-image-2`.
+        When stream is true, returns SSE events such as
+        image_generation.partial_image and image_generation.completed.
       operationId: createImageGeneration
       tags:
         - Images
+      parameters:
+        - $ref: '#/components/parameters/CodexVersionHeader'
       requestBody:
         required: true
         content:
@@ -782,6 +1041,9 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ImagesResponse'
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/ImageStreamEvent'
         '400':
           description: Invalid request or unsupported model
           content:
@@ -818,11 +1080,14 @@ paths:
       summary: Edit images
       description: |
         OpenAI-compatible images edit endpoint.
-        Current implementation supports JSON requests only.
-        Multipart requests return 400 with a clear unsupported message.
+        Supports JSON requests and multipart/form-data with image, image[],
+        mask, and input_fidelity fields. When stream is true, returns SSE
+        events such as image_edit.partial_image and image_edit.completed.
       operationId: createImageEdit
       tags:
         - Images
+      parameters:
+        - $ref: '#/components/parameters/CodexVersionHeader'
       requestBody:
         required: true
         content:
@@ -831,8 +1096,7 @@ paths:
               $ref: '#/components/schemas/ImagesEditsRequest'
           multipart/form-data:
             schema:
-              type: object
-              description: Reserved for future support; currently returns 400.
+              $ref: '#/components/schemas/ImagesEditsMultipartRequest'
       responses:
         '200':
           description: Images response
@@ -840,6 +1104,9 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ImagesResponse'
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/ImageStreamEvent'
         '400':
           description: Invalid request or unsupported model/content type
           content:
@@ -873,10 +1140,8 @@ paths:
 
   /health:
     servers:
-      - url: http://localhost:8080
-        description: Local development server
-      - url: https://api.codex2api.local
-        description: Production server
+      - url: http://example.com
+        description: Root-path placeholder base URL
     get:
       summary: Health check
       description: Returns the health status of the API

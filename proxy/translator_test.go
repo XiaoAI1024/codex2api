@@ -68,6 +68,63 @@ func TestTranslateRequest_PreservesSupportedServiceTier(t *testing.T) {
 	}
 }
 
+func TestNormalizeCodexBuiltinTools(t *testing.T) {
+	raw := []byte(`{
+		"tools":[
+			{"type":"web_search_preview"},
+			{"type":"web_search_preview_2025_03_11"}
+		],
+		"tool_choice":{
+			"type":"web_search_preview_2025_03_11",
+			"tools":[
+				{"type":"web_search_preview"},
+				{"type":"function","name":"keep_me"}
+			]
+		}
+	}`)
+
+	got := normalizeCodexBuiltinTools(raw)
+
+	if typ := gjson.GetBytes(got, "tools.0.type").String(); typ != "web_search" {
+		t.Fatalf("tools.0.type = %q, want web_search", typ)
+	}
+	if typ := gjson.GetBytes(got, "tools.1.type").String(); typ != "web_search" {
+		t.Fatalf("tools.1.type = %q, want web_search", typ)
+	}
+	if typ := gjson.GetBytes(got, "tool_choice.type").String(); typ != "web_search" {
+		t.Fatalf("tool_choice.type = %q, want web_search", typ)
+	}
+	if typ := gjson.GetBytes(got, "tool_choice.tools.0.type").String(); typ != "web_search" {
+		t.Fatalf("tool_choice.tools.0.type = %q, want web_search", typ)
+	}
+	if typ := gjson.GetBytes(got, "tool_choice.tools.1.type").String(); typ != "function" {
+		t.Fatalf("function tool should not be rewritten, got %q", typ)
+	}
+}
+
+func TestEnsureImageGenerationTool(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.4","tools":[{"type":"web_search"}]}`)
+
+	got := ensureImageGenerationTool(raw, "gpt-5.4")
+
+	if typ := gjson.GetBytes(got, "tools.1.type").String(); typ != "image_generation" {
+		t.Fatalf("tools.1.type = %q, want image_generation; body=%s", typ, string(got))
+	}
+	if fmt := gjson.GetBytes(got, "tools.1.output_format").String(); fmt != "png" {
+		t.Fatalf("tools.1.output_format = %q, want png", fmt)
+	}
+}
+
+func TestEnsureImageGenerationToolSkipsSpark(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.3-codex-spark","tools":[{"type":"web_search"}]}`)
+
+	got := ensureImageGenerationTool(raw, "gpt-5.3-codex-spark")
+
+	if gjson.GetBytes(got, "tools.1").Exists() {
+		t.Fatalf("spark model should not get image_generation tool: %s", string(got))
+	}
+}
+
 // ==================== Function Calling 测试 ====================
 
 func TestConvertMessagesToInput_ToolRole(t *testing.T) {

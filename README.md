@@ -201,13 +201,51 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 | --- | --- |
 | `POST /v1/chat/completions` | Chat Completions 风格入口（兼容根路径 `/chat/completions`） |
 | `POST /v1/responses` | Responses 风格入口（兼容根路径 `/responses`） |
+| `GET /v1/responses` | Responses WebSocket 入口（兼容根路径 `/responses`） |
 | `POST /v1/responses/compact` | Responses compact 入口，转发到 Codex 上游 `/responses/compact`；不支持 `stream:true`（兼容根路径 `/responses/compact`） |
 | `POST /backend-api/codex/responses` | Codex CLI direct 兼容入口，等同 `/v1/responses` |
+| `GET /backend-api/codex/responses` | Codex CLI direct WebSocket 入口，等同 `GET /v1/responses` |
 | `POST /backend-api/codex/responses/compact` | Codex CLI direct compact 兼容入口，等同 `/v1/responses/compact` |
+| `POST /v1/images/generations` | Images generation 入口（兼容根路径 `/images/generations`） |
+| `POST /v1/images/edits` | Images edits 入口，支持 JSON 与 `multipart/form-data`（兼容根路径 `/images/edits`） |
 | `GET /v1/models` | 返回可用模型列表（兼容根路径 `/models`） |
 | `GET /health` | 健康检查 |
 
 如果客户端的 `base_url` 不包含 `/v1`，可以直接访问上述根路径兼容入口。若客户端按 Codex CLI 的 `chatgpt_base_url` 形式调用 `/backend-api/codex/*`，可使用 direct 兼容入口。
+
+### CLIProxyAPI 兼容要点
+
+- **Images**：`/v1/images/generations` 与 `/v1/images/edits` 默认使用 `gpt-image-2` 图像工具；`edits` 支持 JSON 输入，也支持 `multipart/form-data` 的 `image` / `image[]`、`mask`、`input_fidelity` 等字段。`stream:true` 时返回 `text/event-stream`，事件类型包含 `image_generation.partial_image`、`image_generation.completed`、`image_edit.partial_image`、`image_edit.completed`，否则返回 OpenAI 风格 JSON。
+- **Responses WebSocket**：`GET /v1/responses`、`GET /responses` 与 `GET /backend-api/codex/responses` 提供 Codex CLI 兼容 WebSocket；客户端发送 `response.create` 或普通 Responses JSON 消息，服务端转发上游 SSE payload 为 WebSocket text frame。
+- **Version 请求头**：默认不合成 `Version`；只有客户端显式传入 `Version: <CODEX_CLI_VERSION>` 时才透传给 Codex 上游。未传该头时保持为空。
+- **Responses builtin tools 标准化**：Responses 与 Chat Completions 会标准化内置工具类型，例如将 `web_search_preview` / `web_search_preview_2025_03_11` 归一为 `web_search`；Chat Completions 的 function tools 会转换为 Codex Responses 工具格式。
+
+非流式图片生成示例：
+
+```bash
+curl -X POST "<BASE_URL>/v1/images/generations" \
+  -H "Authorization: Bearer <API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-image-2",
+    "prompt": "Create a minimal product mockup on a white background",
+    "size": "1024x1024",
+    "response_format": "b64_json"
+  }'
+```
+
+图片编辑 multipart 示例：
+
+```bash
+curl -X POST "<BASE_URL>/v1/images/edits" \
+  -H "Authorization: Bearer <API_KEY>" \
+  -F "model=gpt-image-2" \
+  -F "prompt=Replace the background with a soft studio gradient" \
+  -F "image=@/path/to/input.png" \
+  -F "mask=@/path/to/mask.png" \
+  -F "input_fidelity=high" \
+  -F "response_format=url"
+```
 
 ---
 

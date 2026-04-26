@@ -1,6 +1,10 @@
 package proxy
 
 import (
+	"bytes"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -56,7 +60,7 @@ func TestBuildImagesRequest_Generation(t *testing.T) {
 }
 
 func TestBuildImagesRequest_Edits(t *testing.T) {
-	raw := []byte(`{"quality":"high"}`)
+	raw := []byte(`{"quality":"high","input_fidelity":"high","mask":{"image_url":"data:image/png;base64,MASK"}}`)
 	images := []string{
 		"https://example.com/a.png",
 		"data:image/png;base64,AAA",
@@ -74,6 +78,87 @@ func TestBuildImagesRequest_Edits(t *testing.T) {
 	}
 	if got := gjson.GetBytes(body, "input.0.content.1.image_url").String(); got != images[0] {
 		t.Fatalf("first image mismatch: %q", got)
+	}
+	if got := gjson.GetBytes(body, "tools.0.input_fidelity").String(); got != "high" {
+		t.Fatalf("input_fidelity mismatch: %q", got)
+	}
+	if got := gjson.GetBytes(body, "tools.0.input_image_mask.image_url").String(); got != "data:image/png;base64,MASK" {
+		t.Fatalf("mask image mismatch: %q", got)
+	}
+}
+
+func TestParseMultipartImagesEditRequest(t *testing.T) {
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	_ = writer.WriteField("prompt", "edit this")
+	_ = writer.WriteField("model", "gpt-image-2")
+	_ = writer.WriteField("response_format", "url")
+	_ = writer.WriteField("input_fidelity", "high")
+	imagePart, err := writer.CreateFormFile("image", "input.png")
+	if err != nil {
+		t.Fatalf("create image part: %v", err)
+	}
+	_, _ = imagePart.Write([]byte("fake-png-image"))
+	maskPart, err := writer.CreateFormFile("mask", "mask.png")
+	if err != nil {
+		t.Fatalf("create mask part: %v", err)
+	}
+	_, _ = maskPart.Write([]byte("fake-png-mask"))
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", bytes.NewReader(buf.Bytes()))
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	parsed, err := parseMultipartImagesEditRequest(req)
+	if err != nil {
+		t.Fatalf("parse multipart edit request: %v", err)
+	}
+
+	if parsed.prompt != "edit this" {
+		t.Fatalf("prompt = %q", parsed.prompt)
+	}
+	if parsed.imageModel != "gpt-image-2" {
+		t.Fatalf("model = %q", parsed.imageModel)
+	}
+	if parsed.responseFormat != "url" {
+		t.Fatalf("response_format = %q", parsed.responseFormat)
+	}
+	if len(parsed.images) != 1 || !strings.HasPrefix(parsed.images[0], "data:image/png;base64,") {
+		t.Fatalf("images = %#v", parsed.images)
+	}
+	if !strings.HasPrefix(parsed.mask, "data:image/png;base64,") {
+		t.Fatalf("mask = %q", parsed.mask)
+	}
+	if got := gjson.GetBytes(parsed.rawBody, "input_fidelity").String(); got != "high" {
+		t.Fatalf("raw input_fidelity = %q", got)
+	}
+}
+
+func TestBuildImageStreamPayloads(t *testing.T) {
+	partial := buildImageStreamPayload("image_generation.partial_image", "b64_json", imageCallResult{
+		Result:       "PART",
+		OutputFormat: "png",
+	}, 2, nil)
+	if got := gjson.GetBytes(partial, "type").String(); got != "image_generation.partial_image" {
+		t.Fatalf("partial type = %q", got)
+	}
+	if got := gjson.GetBytes(partial, "partial_image_index").Int(); got != 2 {
+		t.Fatalf("partial index = %d", got)
+	}
+	if got := gjson.GetBytes(partial, "b64_json").String(); got != "PART" {
+		t.Fatalf("partial b64 = %q", got)
+	}
+
+	completed := buildImageStreamPayload("image_edit.completed", "url", imageCallResult{
+		Result:       "DONE",
+		OutputFormat: "webp",
+	}, 0, []byte(`{"total_images":1}`))
+	if got := gjson.GetBytes(completed, "url").String(); got != "data:image/webp;base64,DONE" {
+		t.Fatalf("completed url = %q", got)
+	}
+	if got := gjson.GetBytes(completed, "usage.total_images").Int(); got != 1 {
+		t.Fatalf("usage.total_images = %d", got)
 	}
 }
 

@@ -17,13 +17,14 @@
 
 Codex2API 提供兼容 OpenAI 风格的 API 接口，同时包含完整的管理后台 API。
 
-**推荐 Base URL:** `http://localhost:8080/v1`
+**推荐 Base URL:** `http://example.com/v1`（示例中也可写作 `<BASE_URL>/v1`）
 
-**兼容 Base URL:** `http://localhost:8080`（当客户端不方便携带 `/v1` 前缀时，可直接使用根路径兼容路由）
+**兼容 Base URL:** `http://example.com`（当客户端不方便携带 `/v1` 前缀时，可直接使用根路径兼容路由）
 
 **请求格式:**
 - 请求头: `Content-Type: application/json`
-- 认证头: `Authorization: Bearer <api_key>`
+- 认证头: `Authorization: Bearer <API_KEY>`
+- 可选请求头: `Version: <CODEX_CLI_VERSION>`。Codex2API 默认不合成 `Version`，只有客户端显式传入时才透传给 Codex 上游。
 
 ---
 
@@ -35,7 +36,7 @@ Codex2API 提供兼容 OpenAI 风格的 API 接口，同时包含完整的管理
 
 **请求头:**
 ```http
-Authorization: Bearer sk-xxxxxxxxxxxxxxxxxxxxxxxx
+Authorization: Bearer <API_KEY>
 ```
 
 **配置方式:**
@@ -48,13 +49,13 @@ Authorization: Bearer sk-xxxxxxxxxxxxxxxxxxxxxxxx
 
 **请求头:**
 ```http
-X-Admin-Key: your-admin-secret
+X-Admin-Key: <ADMIN_SECRET>
 ```
 
 或
 
 ```http
-Authorization: Bearer your-admin-secret
+Authorization: Bearer <ADMIN_SECRET>
 ```
 
 **配置方式:**
@@ -145,6 +146,8 @@ data: [DONE]
 
 **兼容端点:** `POST /responses`、`POST /backend-api/codex/responses`
 
+**WebSocket 端点:** `GET /v1/responses`、`GET /responses`、`GET /backend-api/codex/responses`
+
 **Compact 端点:** `POST /v1/responses/compact`、`POST /responses/compact`、`POST /backend-api/codex/responses/compact`
 
 `compact` 路径会请求 Codex 上游真实 `/responses/compact`，返回非流式 compact 响应；如果请求体包含 `stream:true`，会返回 `400 invalid_request_error`。
@@ -177,6 +180,19 @@ data: [DONE]
 | service_tier | string | 否 | 服务等级: fast/auto |
 | include | array | 否 | 包含的额外字段 |
 | previous_response_id | string | 否 | 上一响应 ID，用于上下文连续 |
+| tools | array | 否 | Responses 工具列表；内置工具别名会标准化 |
+| tool_choice | string/object | 否 | 工具选择；`tool_choice.type` 和 `tool_choice.tools[].type` 会标准化 |
+
+**内置工具标准化:**
+
+Codex2API 在转发 Responses / Chat Completions 前会对内置工具类型做兼容归一：
+
+| 输入工具类型 | 上游工具类型 |
+| --- | --- |
+| `web_search_preview` | `web_search` |
+| `web_search_preview_2025_03_11` | `web_search` |
+
+标准化会应用到 `tools[].type`、`tool_choice.type` 和 `tool_choice.tools[].type`。Chat Completions 的 function tool 也会转换为 Codex Responses 的 `{type,name,description,parameters}` 格式。
 
 **响应示例:**
 ```json
@@ -205,7 +221,196 @@ data: [DONE]
 }
 ```
 
-### 3. List Models
+**流式响应示例:**
+
+```text
+data: {"type":"response.created","response":{"id":"resp_xxxxxxxx","model":"gpt-5.4"}}
+
+data: {"type":"response.output_text.delta","delta":"Hello"}
+
+data: {"type":"response.completed","response":{"id":"resp_xxxxxxxx","status":"completed"}}
+
+data: [DONE]
+```
+
+**WebSocket 请求示例:**
+
+```bash
+websocat \
+  -H "Authorization: Bearer <API_KEY>" \
+  -H "Version: <CODEX_CLI_VERSION>" \
+  "ws://example.com/v1/responses"
+```
+
+连接建立后发送 text frame：
+
+```json
+{
+  "type": "response.create",
+  "model": "gpt-5.4",
+  "input": "Hello from WebSocket",
+  "stream": true
+}
+```
+
+服务端返回的每个 WebSocket text frame 是一个 Responses 事件 JSON，例如：
+
+```json
+{"type":"response.completed","response":{"id":"resp_xxxxxxxx","status":"completed"}}
+```
+
+> `Version` 请求头是可选的。未显式传入时，Codex2API 不会合成默认 `Version`；显式传入时会原样透传。
+
+### 3. Images
+
+#### 3.1 Image Generations
+
+**端点:** `POST /v1/images/generations`
+
+**兼容端点:** `POST /images/generations`
+
+**说明:** OpenAI 风格图片生成接口，内部使用 Codex Responses 的 `image_generation` 工具。默认图像工具模型为 `gpt-image-2`。
+
+**请求示例:**
+
+```bash
+curl -X POST "<BASE_URL>/v1/images/generations" \
+  -H "Authorization: Bearer <API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-image-2",
+    "prompt": "Create a clean product mockup on a white background",
+    "size": "1024x1024",
+    "quality": "high",
+    "response_format": "b64_json"
+  }'
+```
+
+**参数说明:**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| prompt | string | 是 | 图片生成提示词 |
+| model | string | 否 | 图像工具模型，默认 `gpt-image-2` |
+| response_format | string | 否 | `b64_json` 或 `url`，默认 `b64_json` |
+| size | string | 否 | 输出尺寸，例如 `1024x1024` |
+| quality | string | 否 | 输出质量 |
+| background | string | 否 | 背景模式 |
+| output_format | string | 否 | 输出格式，例如 `png` / `jpeg` / `webp` |
+| output_compression | integer | 否 | 输出压缩参数 |
+| moderation | string | 否 | 审核模式 |
+| partial_images | integer | 否 | 流式模式下请求的中间图数量 |
+| stream | boolean | 否 | `true` 时返回 SSE；默认返回 JSON |
+| n | integer | 否 | 兼容字段，会被忽略 |
+
+**非流式响应示例:**
+
+```json
+{
+  "created": 1712345678,
+  "data": [
+    {
+      "b64_json": "<BASE64_IMAGE>",
+      "revised_prompt": "Create a clean product mockup on a white background"
+    }
+  ],
+  "output_format": "png",
+  "quality": "high",
+  "size": "1024x1024",
+  "usage": {
+    "total_images": 1
+  }
+}
+```
+
+**流式请求示例:**
+
+```bash
+curl -N -X POST "<BASE_URL>/v1/images/generations" \
+  -H "Authorization: Bearer <API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-image-2",
+    "prompt": "Create a small app icon",
+    "partial_images": 2,
+    "stream": true,
+    "response_format": "b64_json"
+  }'
+```
+
+**流式响应示例:**
+
+```text
+data: {"type":"image_generation.partial_image","partial_image_index":0,"b64_json":"<BASE64_IMAGE_CHUNK>"}
+
+data: {"type":"image_generation.completed","b64_json":"<BASE64_IMAGE>","usage":{"total_images":1}}
+
+data: [DONE]
+```
+
+#### 3.2 Image Edits
+
+**端点:** `POST /v1/images/edits`
+
+**兼容端点:** `POST /images/edits`
+
+**说明:** OpenAI 风格图片编辑接口，支持 JSON 请求与 `multipart/form-data`。`mask` 和 `input_fidelity` 会映射到 Codex image tool 参数。
+
+**JSON 请求示例:**
+
+```bash
+curl -X POST "<BASE_URL>/v1/images/edits" \
+  -H "Authorization: Bearer <API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-image-2",
+    "prompt": "Keep the product and replace the background with a studio gradient",
+    "image": "http://example.com/input.png",
+    "mask": {"image_url": "http://example.com/mask.png"},
+    "input_fidelity": "high",
+    "response_format": "url"
+  }'
+```
+
+**multipart 请求示例:**
+
+```bash
+curl -X POST "<BASE_URL>/v1/images/edits" \
+  -H "Authorization: Bearer <API_KEY>" \
+  -F "model=gpt-image-2" \
+  -F "prompt=Keep the subject and replace the background" \
+  -F "image=@/path/to/input.png" \
+  -F "mask=@/path/to/mask.png" \
+  -F "input_fidelity=high" \
+  -F "response_format=url"
+```
+
+**参数说明:**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| prompt | string | 是 | 编辑提示词 |
+| image | string/file/array | 是 | 输入图片；JSON 支持 URL、data URL、裸 base64 或对象数组；multipart 支持 `image` 或重复 `image[]` |
+| images | array | 否 | JSON 模式的附加输入图片 |
+| mask | string/object/file | 否 | 遮罩图片；JSON 支持 `mask` 或 `mask.image_url`，multipart 使用 `mask` 文件字段 |
+| model | string | 否 | 图像工具模型，默认 `gpt-image-2` |
+| input_fidelity | string | 否 | 输入保真度，例如 `high` |
+| response_format | string | 否 | `b64_json` 或 `url`，默认 `b64_json` |
+| size / quality / background / output_format / output_compression / moderation / partial_images | mixed | 否 | 与图片生成一致 |
+| stream | boolean | 否 | `true` 时返回 SSE，事件前缀为 `image_edit` |
+| n | integer | 否 | 兼容字段，会被忽略 |
+
+**流式响应示例:**
+
+```text
+data: {"type":"image_edit.partial_image","partial_image_index":0,"url":"data:image/png;base64,<BASE64_IMAGE_CHUNK>"}
+
+data: {"type":"image_edit.completed","url":"data:image/png;base64,<BASE64_IMAGE>","usage":{"total_images":1}}
+
+data: [DONE]
+```
+
+### 4. List Models
 
 **端点:** `GET /v1/models`
 
@@ -225,7 +430,7 @@ data: [DONE]
 }
 ```
 
-### 4. Health Check
+### 5. Health Check
 
 **端点:** `GET /health`
 
@@ -330,7 +535,7 @@ data: [DONE]
 ```json
 {
   "name": "my-account",
-  "refresh_token": "rt_xxxxxxxxxxxx",
+  "refresh_token": "<REFRESH_TOKEN>",
   "proxy_url": "http://proxy.example.com:8080"
 }
 ```
@@ -339,7 +544,7 @@ data: [DONE]
 ```json
 {
   "name": "batch",
-  "refresh_token": "rt_xxx1\nrt_xxx2\nrt_xxx3",
+  "refresh_token": "<REFRESH_TOKEN_1>\n<REFRESH_TOKEN_2>\n<REFRESH_TOKEN_3>",
   "proxy_url": ""
 }
 ```
@@ -475,11 +680,11 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
     "type": "codex",
     "email": "user@example.com",
     "expired": "2024-12-31T23:59:59Z",
-    "id_token": "id_xxx",
-    "account_id": "acc_xxx",
-    "access_token": "at_xxx",
+    "id_token": "<ID_TOKEN>",
+    "account_id": "<ACCOUNT_ID>",
+    "access_token": "<ACCESS_TOKEN>",
     "last_refresh": "2024-01-01T12:00:00Z",
-    "refresh_token": "rt_xxx"
+    "refresh_token": "<REFRESH_TOKEN>"
   }
 ]
 ```
@@ -491,8 +696,8 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 **请求:**
 ```json
 {
-  "url": "http://remote-instance:8080",
-  "admin_key": "remote-admin-secret"
+  "url": "http://example.com",
+  "admin_key": "<ADMIN_SECRET>"
 }
 ```
 
@@ -622,7 +827,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
     {
       "id": 1,
       "name": "default",
-      "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxx",
+      "key": "<API_KEY>",
       "created_at": "2024-01-01T00:00:00Z"
     }
   ]
@@ -637,7 +842,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 ```json
 {
   "name": "production",
-  "key": "sk-custom-key"  // 可选，不填则自动生成
+  "key": "<CUSTOM_API_KEY>"  // 可选，不填则自动生成
 }
 ```
 
@@ -645,7 +850,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 ```json
 {
   "id": 2,
-  "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxx",
+  "key": "<API_KEY>",
   "name": "production"
 }
 ```
@@ -801,7 +1006,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 ```json
 {
   "success": true,
-  "ip": "1.2.3.4",
+  "ip": "<PUBLIC_IP>",
   "country": "United States",
   "region": "California",
   "city": "Los Angeles",
@@ -905,7 +1110,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 ```json
 {
   "provider": "google",
-  "redirect_uri": "http://localhost:8080/admin/oauth/callback"
+  "redirect_uri": "http://example.com/admin/oauth/callback"
 }
 ```
 
@@ -917,8 +1122,8 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 ```json
 {
   "provider": "google",
-  "code": "auth_code_from_callback",
-  "redirect_uri": "http://localhost:8080/admin/oauth/callback"
+  "code": "<AUTH_CODE>",
+  "redirect_uri": "http://example.com/admin/oauth/callback"
 }
 ```
 

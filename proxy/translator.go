@@ -53,6 +53,7 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 
 	// 6. 转换 tools 格式: OpenAI Chat {type, function:{name,description,parameters}} → Codex {type, name, description, parameters}
 	result = convertToolsFormat(result)
+	result = normalizeCodexBuiltinTools(result)
 	// 清理 function tool parameters 中上游不支持的 JSON Schema 关键字
 	result = sanitizeToolSchemas(result)
 
@@ -66,6 +67,85 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 	result, _ = sjson.SetBytes(result, "include", []string{"reasoning.encrypted_content"})
 
 	return result, nil
+}
+
+func normalizeCodexResponsesBody(body []byte) []byte {
+	body = convertSystemRoleToDeveloper(body)
+	body = normalizeCodexBuiltinTools(body)
+	return body
+}
+
+func normalizeCodexBuiltinTools(rawJSON []byte) []byte {
+	result := rawJSON
+
+	tools := gjson.GetBytes(result, "tools")
+	if tools.IsArray() {
+		for i := 0; i < len(tools.Array()); i++ {
+			result = normalizeCodexBuiltinToolAtPath(result, fmt.Sprintf("tools.%d.type", i))
+		}
+	}
+
+	result = normalizeCodexBuiltinToolAtPath(result, "tool_choice.type")
+
+	toolChoiceTools := gjson.GetBytes(result, "tool_choice.tools")
+	if toolChoiceTools.IsArray() {
+		for i := 0; i < len(toolChoiceTools.Array()); i++ {
+			result = normalizeCodexBuiltinToolAtPath(result, fmt.Sprintf("tool_choice.tools.%d.type", i))
+		}
+	}
+
+	return result
+}
+
+func normalizeCodexBuiltinToolAtPath(rawJSON []byte, path string) []byte {
+	currentType := gjson.GetBytes(rawJSON, path).String()
+	normalizedType := normalizeCodexBuiltinToolType(currentType)
+	if normalizedType == "" {
+		return rawJSON
+	}
+	updated, err := sjson.SetBytes(rawJSON, path, normalizedType)
+	if err != nil {
+		return rawJSON
+	}
+	return updated
+}
+
+func normalizeCodexBuiltinToolType(toolType string) string {
+	switch strings.TrimSpace(toolType) {
+	case "web_search_preview", "web_search_preview_2025_03_11":
+		return "web_search"
+	default:
+		return ""
+	}
+}
+
+var imageGenerationToolJSON = []byte(`{"type":"image_generation","output_format":"png"}`)
+var imageGenerationToolArrayJSON = []byte(`[{"type":"image_generation","output_format":"png"}]`)
+
+func accountUsesFreePlan(accountPlan string) bool {
+	return strings.EqualFold(strings.TrimSpace(accountPlan), "free")
+}
+
+func ensureImageGenerationTool(body []byte, model string, accountPlan ...string) []byte {
+	if strings.HasSuffix(strings.ToLower(strings.TrimSpace(model)), "spark") {
+		return body
+	}
+	if len(accountPlan) > 0 && accountUsesFreePlan(accountPlan[0]) {
+		return body
+	}
+
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		body, _ = sjson.SetRawBytes(body, "tools", imageGenerationToolArrayJSON)
+		return body
+	}
+	for _, tool := range tools.Array() {
+		if tool.Get("type").String() == "image_generation" {
+			return body
+		}
+	}
+	body, _ = sjson.SetRawBytes(body, "tools.-1", imageGenerationToolJSON)
+	return body
 }
 
 // clampReasoningEffort 将 reasoning.effort 按模型能力钳位。
