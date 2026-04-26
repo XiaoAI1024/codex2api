@@ -1,4 +1,4 @@
-import type { ChangeEvent } from 'react'
+import type { ChangeEvent, ReactElement } from 'react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, getAdminKey } from '../api'
 import Modal from '../components/Modal'
@@ -2338,7 +2338,7 @@ function UsageCell({ account, t }: { account: AccountRow; t: (key: string, optio
       })
     : t('accounts.uploadSourceAdmin')
 
-  const wrap = (content: JSX.Element, widthClass: string) => (
+  const wrap = (content: ReactElement, widthClass: string) => (
     <div className={`${widthClass} space-y-1`}>
       <div className="text-[11px] text-muted-foreground">{uploaderText}</div>
       {content}

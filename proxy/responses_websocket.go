@@ -69,7 +69,7 @@ func (h *Handler) ResponsesWebsocket(c *gin.Context) {
 			continue
 		}
 
-		output, err := h.forwardResponsesWebsocketRequest(c, conn, normalized)
+		output, preparedSnapshot, err := h.forwardResponsesWebsocketRequest(c, conn, normalized)
 		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) {
 				return
@@ -78,7 +78,11 @@ func (h *Handler) ResponsesWebsocket(c *gin.Context) {
 			return
 		}
 
-		lastRequest = nextRequest
+		if len(preparedSnapshot) > 0 {
+			lastRequest = preparedSnapshot
+		} else {
+			lastRequest = nextRequest
+		}
 		lastResponseOutput = output
 	}
 }
@@ -268,7 +272,8 @@ func prepareResponsesWebsocketCodexBody(rawBody []byte, model string) (body []by
 	body = sanitizeToolSchemas(body)
 	body = normalizeCodexResponsesBody(body)
 
-	body, expandedInputRaw = expandPreviousResponse(body)
+	body, _ = expandPreviousResponse(body)
+	expandedInputRaw = normalizeResponsesWebsocketJSONArrayRaw([]byte(gjson.GetBytes(body, "input").Raw))
 
 	unsupportedFields := []string{
 		"max_output_tokens", "max_tokens", "max_completion_tokens",
@@ -284,30 +289,43 @@ func prepareResponsesWebsocketCodexBody(rawBody []byte, model string) (body []by
 	return body, expandedInputRaw, reasoningEffort, serviceTier, nil
 }
 
-func (h *Handler) forwardResponsesWebsocketRequest(c *gin.Context, conn *websocket.Conn, rawBody []byte) ([]byte, error) {
+func responsesWebsocketPreparedSnapshot(rawBody []byte, expandedInputRaw string) []byte {
+	snapshot := bytes.Clone(rawBody)
+	if strings.TrimSpace(expandedInputRaw) == "" {
+		expandedInputRaw = "[]"
+	}
+	snapshot, _ = sjson.DeleteBytes(snapshot, "type")
+	snapshot, _ = sjson.DeleteBytes(snapshot, "previous_response_id")
+	snapshot, _ = sjson.SetBytes(snapshot, "stream", true)
+	snapshot, _ = sjson.SetRawBytes(snapshot, "input", []byte(expandedInputRaw))
+	return snapshot
+}
+
+func (h *Handler) forwardResponsesWebsocketRequest(c *gin.Context, conn *websocket.Conn, rawBody []byte) ([]byte, []byte, error) {
 	if len(rawBody) > security.MaxRequestBodySize {
-		return []byte("[]"), writeResponsesWebsocketError(conn, http.StatusRequestEntityTooLarge, "请求体过大", "invalid_request_error")
+		return []byte("[]"), nil, writeResponsesWebsocketError(conn, http.StatusRequestEntityTooLarge, "请求体过大", "invalid_request_error")
 	}
 	if h == nil || h.store == nil {
-		return []byte("[]"), writeResponsesWebsocketError(conn, http.StatusServiceUnavailable, "无可用账号，请稍后重试", "server_error")
+		return []byte("[]"), nil, writeResponsesWebsocketError(conn, http.StatusServiceUnavailable, "无可用账号，请稍后重试", "server_error")
 	}
 
 	model := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
 	if model == "" {
-		return []byte("[]"), writeResponsesWebsocketError(conn, http.StatusBadRequest, "missing required field: model", "invalid_request_error")
+		return []byte("[]"), nil, writeResponsesWebsocketError(conn, http.StatusBadRequest, "missing required field: model", "invalid_request_error")
 	}
 	if err := security.ValidateModelName(model); err != nil {
-		return []byte("[]"), writeResponsesWebsocketError(conn, http.StatusBadRequest, "model 参数无效", "invalid_request_error")
+		return []byte("[]"), nil, writeResponsesWebsocketError(conn, http.StatusBadRequest, "model 参数无效", "invalid_request_error")
 	}
 	if IsImageOnlyModel(model) {
-		return []byte("[]"), writeResponsesWebsocketError(conn, http.StatusBadRequest, fmt.Sprintf("model '%s' is only supported on /v1/images/generations and /v1/images/edits", model), "invalid_request_error")
+		return []byte("[]"), nil, writeResponsesWebsocketError(conn, http.StatusBadRequest, fmt.Sprintf("model '%s' is only supported on /v1/images/generations and /v1/images/edits", model), "invalid_request_error")
 	}
 	c.Set("x-model", model)
 
 	codexBody, expandedInputRaw, reasoningEffort, serviceTier, err := prepareResponsesWebsocketCodexBody(rawBody, model)
 	if err != nil {
-		return []byte("[]"), writeResponsesWebsocketError(conn, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		return []byte("[]"), nil, writeResponsesWebsocketError(conn, http.StatusBadRequest, err.Error(), "invalid_request_error")
 	}
+	preparedSnapshot := responsesWebsocketPreparedSnapshot(rawBody, expandedInputRaw)
 	if serviceTier != "" {
 		c.Set("x-service-tier", serviceTier)
 	}
@@ -328,12 +346,12 @@ func (h *Handler) forwardResponsesWebsocketRequest(c *gin.Context, conn *websock
 		if account == nil {
 			if lastStatusCode != 0 && len(lastBody) > 0 {
 				status, message, errType := responsesWebsocketUpstreamError(lastStatusCode, lastBody)
-				return []byte("[]"), writeResponsesWebsocketError(conn, status, message, errType)
+				return []byte("[]"), nil, writeResponsesWebsocketError(conn, status, message, errType)
 			}
 			if lastErr != nil {
-				return []byte("[]"), writeResponsesWebsocketError(conn, http.StatusBadGateway, "上游请求失败: "+lastErr.Error(), "upstream_error")
+				return []byte("[]"), nil, writeResponsesWebsocketError(conn, http.StatusBadGateway, "上游请求失败: "+lastErr.Error(), "upstream_error")
 			}
-			return []byte("[]"), writeResponsesWebsocketError(conn, http.StatusServiceUnavailable, "无可用账号，请稍后重试", "server_error")
+			return []byte("[]"), nil, writeResponsesWebsocketError(conn, http.StatusServiceUnavailable, "无可用账号，请稍后重试", "server_error")
 		}
 
 		start := time.Now()
@@ -367,7 +385,7 @@ func (h *Handler) forwardResponsesWebsocketRequest(c *gin.Context, conn *websock
 			excludeAccounts[account.ID()] = true
 			lastErr = reqErr
 			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
-				return []byte("[]"), writeResponsesWebsocketError(conn, http.StatusBadGateway, reqErr.Error(), "upstream_error")
+				return []byte("[]"), nil, writeResponsesWebsocketError(conn, http.StatusBadGateway, reqErr.Error(), "upstream_error")
 			}
 			continue
 		}
@@ -391,22 +409,22 @@ func (h *Handler) forwardResponsesWebsocketRequest(c *gin.Context, conn *websock
 				continue
 			}
 			status, message, errType := responsesWebsocketUpstreamError(resp.StatusCode, errBody)
-			return []byte("[]"), writeResponsesWebsocketError(conn, status, message, errType)
+			return []byte("[]"), nil, writeResponsesWebsocketError(conn, status, message, errType)
 		}
 
 		output, err := h.forwardResponsesWebsocketStream(c, conn, account, resp, expandedInputRaw, model, reasoningEffort, serviceTier, requestStartedAt, start, attempt+1)
 		h.store.Release(account)
-		return output, err
+		return output, preparedSnapshot, err
 	}
 
 	if lastErr != nil {
-		return []byte("[]"), writeResponsesWebsocketError(conn, http.StatusBadGateway, "上游请求失败: "+lastErr.Error(), "upstream_error")
+		return []byte("[]"), nil, writeResponsesWebsocketError(conn, http.StatusBadGateway, "上游请求失败: "+lastErr.Error(), "upstream_error")
 	}
 	if lastStatusCode != 0 {
 		status, message, errType := responsesWebsocketUpstreamError(lastStatusCode, lastBody)
-		return []byte("[]"), writeResponsesWebsocketError(conn, status, message, errType)
+		return []byte("[]"), nil, writeResponsesWebsocketError(conn, status, message, errType)
 	}
-	return []byte("[]"), writeResponsesWebsocketError(conn, http.StatusBadGateway, "上游请求失败", "upstream_error")
+	return []byte("[]"), nil, writeResponsesWebsocketError(conn, http.StatusBadGateway, "上游请求失败", "upstream_error")
 }
 
 func (h *Handler) forwardResponsesWebsocketStream(
@@ -433,6 +451,9 @@ func (h *Handler) forwardResponsesWebsocketStream(
 	firstTokenMs := 0
 	attemptFirstTokenMs := 0
 	actualServiceTier := ""
+	terminalFailureMessage := ""
+	terminalFailureStatusCode := 0
+	var terminalFailureBody []byte
 
 	readErr := ReadSSEStream(resp.Body, func(data []byte) bool {
 		eventType := gjson.GetBytes(data, "type").String()
@@ -460,6 +481,8 @@ func (h *Handler) forwardResponsesWebsocketStream(
 		}
 		if eventType == responsesWebsocketEventFailed || eventType == responsesWebsocketEventError {
 			gotTerminal = true
+			terminalFailureMessage, terminalFailureStatusCode = responsesWebsocketFailureDetails(data, eventType)
+			terminalFailureBody = bytes.Clone(data)
 		}
 
 		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
@@ -472,7 +495,29 @@ func (h *Handler) forwardResponsesWebsocketStream(
 	attemptDuration := int(time.Since(start).Milliseconds())
 	totalDuration := int(time.Since(requestStartedAt).Milliseconds())
 	outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+	if terminalFailureMessage != "" {
+		failureKind := classifyHTTPFailure(terminalFailureStatusCode, terminalFailureBody)
+		if failureKind == "" {
+			if terminalFailureStatusCode >= 400 && terminalFailureStatusCode < 500 {
+				failureKind = "client"
+			} else {
+				failureKind = "server"
+			}
+		}
+		outcome = streamOutcome{
+			logStatusCode:  terminalFailureStatusCode,
+			failureKind:    failureKind,
+			failureMessage: "上游响应失败: " + terminalFailureMessage,
+			penalize:       true,
+		}
+		if outcome.logStatusCode == 0 {
+			outcome.logStatusCode = http.StatusBadGateway
+		}
+	}
 	if outcome.penalize {
+		if terminalFailureStatusCode != 0 {
+			h.applyCooldown(account, terminalFailureStatusCode, terminalFailureBody, resp)
+		}
 		recyclePooledClientForAccount(account)
 		h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(attemptDuration)*time.Millisecond)
 	} else if outcome.logStatusCode == http.StatusOK {
@@ -493,6 +538,58 @@ func (h *Handler) forwardResponsesWebsocketStream(
 		return completedOutput, writeResponsesWebsocketError(conn, http.StatusRequestTimeout, "stream closed before response.completed", "upstream_error")
 	}
 	return completedOutput, nil
+}
+
+func responsesWebsocketFailureDetails(data []byte, eventType string) (string, int) {
+	messagePaths := []string{
+		"response.error.message",
+		"response.status_details.error.message",
+		"error.message",
+		"message",
+	}
+	message := ""
+	for _, path := range messagePaths {
+		if value := strings.TrimSpace(gjson.GetBytes(data, path).String()); value != "" {
+			message = value
+			break
+		}
+	}
+	if message == "" {
+		message = eventType
+	}
+
+	statusCode := int(gjson.GetBytes(data, "status").Int())
+	if statusCode == 0 {
+		statusCode = int(gjson.GetBytes(data, "status_code").Int())
+	}
+	if statusCode == 0 {
+		statusCode = int(gjson.GetBytes(data, "response.status").Int())
+	}
+	if statusCode == 0 {
+		statusCode = int(gjson.GetBytes(data, "response.status_code").Int())
+	}
+
+	errType := strings.ToLower(strings.TrimSpace(firstNonEmptyGJSON(data,
+		"response.error.type",
+		"response.status_details.error.type",
+		"error.type",
+	)))
+	if statusCode == 0 && strings.Contains(errType, "rate_limit") {
+		statusCode = http.StatusTooManyRequests
+	}
+	if statusCode == 0 {
+		statusCode = http.StatusBadGateway
+	}
+	return message, statusCode
+}
+
+func firstNonEmptyGJSON(data []byte, paths ...string) string {
+	for _, path := range paths {
+		if value := strings.TrimSpace(gjson.GetBytes(data, path).String()); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func isResponsesWebsocketTerminalEvent(eventType string) bool {

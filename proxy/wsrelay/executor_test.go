@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -152,6 +153,51 @@ func TestWebsocketAcquireConnectionDoesNotCloseActiveSameAccountConnection(t *te
 	}
 }
 
+func TestWebsocketPongHandlerRefreshesReadDeadline(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		time.Sleep(25 * time.Millisecond)
+		_ = conn.WriteControl(websocket.PongMessage, []byte("keepalive"), time.Now().Add(time.Second))
+		time.Sleep(100 * time.Millisecond)
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed"}`))
+	}))
+	defer server.Close()
+
+	manager := NewManager()
+	defer manager.Stop()
+
+	account := &auth.Account{
+		DBID:        123,
+		AccessToken: "access-token",
+		AccountID:   "account-id",
+	}
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	wc, err := manager.AcquireConnection(context.Background(), account, wsURL, nil, "")
+	if err != nil {
+		t.Fatalf("AcquireConnection: %v", err)
+	}
+	defer wc.Close()
+
+	if err := wc.conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	_, data, err := wc.conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("ReadMessage should survive past original deadline after pong: %v", err)
+	}
+	if string(data) != `{"type":"response.completed"}` {
+		t.Fatalf("message = %s, want response.completed", string(data))
+	}
+}
+
 func TestPrepareWebsocketBodyPreservesPreviousResponseID(t *testing.T) {
 	exec := &Executor{}
 	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp-prev","input":[{"type":"message","role":"user","content":"again"}]}`)
@@ -163,6 +209,77 @@ func TestPrepareWebsocketBodyPreservesPreviousResponseID(t *testing.T) {
 	}
 	if typ := gjson.GetBytes(got, "type").String(); typ != "response.create" {
 		t.Fatalf("type = %q, want response.create; body=%s", typ, string(got))
+	}
+}
+
+func TestExecuteRequestWebsocketBodyCloseClosesUpstreamImmediately(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	closed := make(chan error, 1)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			closed <- err
+			return
+		}
+		defer conn.Close()
+
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, _, err := conn.ReadMessage(); err != nil {
+			closed <- err
+			return
+		}
+		_, _, err = conn.ReadMessage()
+		closed <- err
+	}))
+	defer server.Close()
+
+	manager := NewManager()
+	defer manager.Stop()
+	oldBaseURL := codexWebsocketBaseURL
+	oldExecutor := globalExecutor
+	oldOnce := executorOnce
+	codexWebsocketBaseURL = server.URL
+	executorOnce = sync.Once{}
+	executorOnce.Do(func() {
+		globalExecutor = NewExecutorWithManager(manager)
+	})
+	defer func() {
+		codexWebsocketBaseURL = oldBaseURL
+		globalExecutor = oldExecutor
+		executorOnce = oldOnce
+	}()
+
+	account := &auth.Account{
+		DBID:        123,
+		AccessToken: "access-token",
+		AccountID:   "account-id",
+	}
+	resp, err := ExecuteRequestWebsocket(
+		context.Background(),
+		account,
+		[]byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":"hello"}]}`),
+		"session-id",
+		"",
+		"sk-test",
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("ExecuteRequestWebsocket: %v", err)
+	}
+
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("Body.Close: %v", err)
+	}
+
+	select {
+	case err := <-closed:
+		if err == nil {
+			t.Fatal("server saw nil error, want websocket close/read error")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Body.Close did not close upstream websocket promptly")
 	}
 }
 

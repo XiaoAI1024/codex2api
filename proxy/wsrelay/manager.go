@@ -399,7 +399,7 @@ func (m *Manager) createConnection(
 	conn.SetPongHandler(func(appData string) error {
 		session.HandlePong()
 		wc.Touch()
-		return nil
+		return conn.SetReadDeadline(time.Now().Add(ReadTimeout))
 	})
 
 	return wc, nil

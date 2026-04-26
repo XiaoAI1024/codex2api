@@ -383,6 +383,102 @@ func TestImagesStream_FirstFrameFailureReturnsJSONBadGateway(t *testing.T) {
 	}
 }
 
+func TestImagesStream_FirstFrameFailureRetriesWhenMaxRetriesPositive(t *testing.T) {
+	var upstreamCalls int32
+	withImagesUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		call := atomic.AddInt32(&upstreamCalls, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if call == 1 {
+			return
+		}
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"output":[{"type":"image_generation_call","result":"DONE","output_format":"png"}]}}` + "\n\n"))
+	})
+	handler, _ := newImagesTestHandler(t, 2, 1)
+
+	rec := performImageGenerationRequest(handler, `{"prompt":"draw a cat","stream":true}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := atomic.LoadInt32(&upstreamCalls); got != 2 {
+		t.Fatalf("upstream calls = %d, want retry once after pre-frame failure", got)
+	}
+	if !strings.Contains(rec.Body.String(), "image_generation.completed") || !strings.Contains(rec.Body.String(), "DONE") {
+		t.Fatalf("stream body should contain completed image from retry, got %q", rec.Body.String())
+	}
+}
+
+func TestImagesStream_ResponseCreatedThenClosedDoesNotRetryAcrossAccounts(t *testing.T) {
+	var upstreamCalls int32
+	withImagesUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamCalls, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`data: {"type":"response.created","response":{"id":"resp_img_1"}}` + "\n\n"))
+	})
+	handler, _ := newImagesTestHandler(t, 3, 2)
+
+	rec := performImageGenerationRequest(handler, `{"prompt":"draw a cat","stream":true}`)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := atomic.LoadInt32(&upstreamCalls); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1 after upstream accepted the image request", got)
+	}
+}
+
+func TestImagesStream_OutputItemDoneThenClosedDoesNotRetryAcrossAccounts(t *testing.T) {
+	var upstreamCalls int32
+	withImagesUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamCalls, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","result":"PARTIAL_DONE","output_format":"png"}}` + "\n\n"))
+	})
+	handler, _ := newImagesTestHandler(t, 3, 2)
+
+	rec := performImageGenerationRequest(handler, `{"prompt":"draw a cat","stream":true}`)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := atomic.LoadInt32(&upstreamCalls); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1 after upstream image output to avoid duplicate generation", got)
+	}
+}
+
+func TestImagesStream_FirstPacketKeepAliveDisablesTransparentRetry(t *testing.T) {
+	oldGrace := imageStreamFirstPacketGrace
+	imageStreamFirstPacketGrace = 10 * time.Millisecond
+	t.Cleanup(func() { imageStreamFirstPacketGrace = oldGrace })
+
+	var upstreamCalls int32
+	withImagesUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamCalls, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		time.Sleep(50 * time.Millisecond)
+	})
+	handler, _ := newImagesTestHandler(t, 2, 1)
+
+	rec := performImageGenerationRequest(handler, `{"prompt":"draw a cat","stream":true}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want committed SSE 200 after keep-alive; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := atomic.LoadInt32(&upstreamCalls); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1 after downstream header/body is committed", got)
+	}
+	if !strings.Contains(rec.Body.String(), ": keep-alive") || !strings.Contains(rec.Body.String(), "event: error") {
+		t.Fatalf("stream body should contain keep-alive then error event, got %q", rec.Body.String())
+	}
+}
+
 func TestImagesStream_ResponseFailedRecordsFailure(t *testing.T) {
 	withImagesUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

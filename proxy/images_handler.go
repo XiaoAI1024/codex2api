@@ -29,6 +29,8 @@ const (
 	defaultImagesToolModel = "gpt-image-2"
 )
 
+var imageStreamFirstPacketGrace = 2 * time.Second
+
 type imageCallResult struct {
 	Result        string
 	RevisedPrompt string
@@ -46,6 +48,16 @@ type imagesEditRequest struct {
 	images         []string
 	mask           string
 	stream         bool
+}
+
+type imageStreamForwardResult struct {
+	wroteDownstream bool
+	sawRetryBarrier bool
+	writeErr        error
+}
+
+func (r imageStreamForwardResult) canTransparentRetry(c *gin.Context) bool {
+	return c.Request.Context().Err() == nil && !r.wroteDownstream && !r.sawRetryBarrier && r.writeErr == nil && !c.Writer.Written()
 }
 
 // ImagesGenerations 处理 /v1/images/generations。
@@ -520,17 +532,17 @@ func (h *Handler) executeImageEndpoint(c *gin.Context, endpoint, imageModel, res
 		}
 
 		if stream {
-			wroteStreamBody, streamErr := h.forwardImageStream(c, resp.Body, responseFormat, streamPrefix, account, endpoint, imageModel, requestStartedAt, start)
+			streamResult, streamErr := h.forwardImageStream(c, resp.Body, responseFormat, streamPrefix, account, endpoint, imageModel, requestStartedAt, start)
 			resp.Body.Close()
 			h.persistUsageAndSettleFromResponse(account, resp)
 			h.store.Release(account)
 			if streamErr != nil {
-				if !wroteStreamBody && attempt < maxRetries {
+				if streamResult.canTransparentRetry(c) && attempt < maxRetries {
 					excludeAccounts[account.ID()] = true
 					lastErr = streamErr
 					continue
 				}
-				if !wroteStreamBody && !c.Writer.Written() {
+				if !streamResult.wroteDownstream && !c.Writer.Written() {
 					c.JSON(http.StatusBadGateway, gin.H{
 						"error": gin.H{"message": "上游请求失败: " + streamErr.Error(), "type": "upstream_error"},
 					})
@@ -746,13 +758,15 @@ func mergeCompletedUsage(base []byte, usageEvent []byte) []byte {
 	return merged
 }
 
-func (h *Handler) forwardImageStream(c *gin.Context, body io.Reader, responseFormat string, streamPrefix string, account *auth.Account, endpoint string, imageModel string, requestStartedAt time.Time, start time.Time) (bool, error) {
+func (h *Handler) forwardImageStream(c *gin.Context, body io.Reader, responseFormat string, streamPrefix string, account *auth.Account, endpoint string, imageModel string, requestStartedAt time.Time, start time.Time) (imageStreamForwardResult, error) {
+	result := imageStreamForwardResult{}
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": gin.H{"message": "streaming not supported", "type": "server_error"},
 		})
-		return true, fmt.Errorf("streaming not supported")
+		result.wroteDownstream = true
+		return result, fmt.Errorf("streaming not supported")
 	}
 
 	headersPrepared := false
@@ -780,6 +794,14 @@ func (h *Handler) forwardImageStream(c *gin.Context, body io.Reader, responseFor
 		flusher.Flush()
 		return nil
 	}
+	writeKeepAlive := func() error {
+		prepareHeaders()
+		if _, err := fmt.Fprint(c.Writer, ": keep-alive\n\n"); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
 
 	var usage *UsageInfo
 	var writeErr error
@@ -795,75 +817,156 @@ func (h *Handler) forwardImageStream(c *gin.Context, body io.Reader, responseFor
 		streamFailureMessage = message
 		if err := writeImageStreamError(writeEvent, http.StatusBadGateway, message); err != nil {
 			writeErr = err
+			result.writeErr = err
 			return false
 		}
 		wroteAny = true
+		result.wroteDownstream = true
 		return false
 	}
 
-	readErr = ReadSSEStream(body, func(data []byte) bool {
-		eventType := gjson.GetBytes(data, "type").String()
-		if !firstFrameRecorded {
-			firstFrameRecorded = true
-			logUpstreamFirstFrame(c, endpoint, 1, eventType, requestStartedAt, start)
-		}
-
-		switch eventType {
-		case "response.image_generation_call.partial_image":
-			b64 := strings.TrimSpace(gjson.GetBytes(data, "partial_image_b64").String())
-			if b64 == "" {
+	type imageStreamReadEvent struct {
+		data []byte
+		err  error
+	}
+	readEvents := make(chan imageStreamReadEvent, 1)
+	doneReading := make(chan struct{})
+	defer close(doneReading)
+	go func() {
+		err := ReadSSEStream(body, func(data []byte) bool {
+			dataCopy := append([]byte(nil), data...)
+			select {
+			case readEvents <- imageStreamReadEvent{data: dataCopy}:
 				return true
+			case <-doneReading:
+				return false
 			}
-			eventName := streamPrefix + ".partial_image"
-			payload := buildImageStreamPayload(eventName, responseFormat, imageCallResult{
-				Result:       b64,
-				OutputFormat: strings.TrimSpace(gjson.GetBytes(data, "output_format").String()),
-			}, gjson.GetBytes(data, "partial_image_index").Int(), nil)
-			writeErr = writeEvent(eventName, payload)
-			wroteAny = true
-			return writeErr == nil
-		case "response.output_item.done":
-			item := gjson.GetBytes(data, "item")
-			if parsed, ok := parseImageCallResultFromItem(item); ok {
-				if idx := gjson.GetBytes(data, "output_index"); idx.Exists() {
-					itemsByIndex[idx.Int()] = parsed
-				} else {
-					fallbackItems = append(fallbackItems, parsed)
+		})
+		select {
+		case readEvents <- imageStreamReadEvent{err: err}:
+		case <-doneReading:
+		}
+	}()
+
+	keepAliveTimer := time.NewTimer(imageStreamFirstPacketGrace)
+	defer keepAliveTimer.Stop()
+	keepAliveC := keepAliveTimer.C
+	keepReading := true
+
+	for keepReading {
+		select {
+		case event := <-readEvents:
+			if event.data == nil {
+				readErr = event.err
+				keepReading = false
+				break
+			}
+			data := event.data
+			eventType := gjson.GetBytes(data, "type").String()
+			if !firstFrameRecorded {
+				firstFrameRecorded = true
+				logUpstreamFirstFrame(c, endpoint, 1, eventType, requestStartedAt, start)
+			}
+			result.sawRetryBarrier = true
+			if isImageStreamRetryBarrierEvent(eventType, data) {
+				result.sawRetryBarrier = true
+			}
+
+			switch eventType {
+			case "response.image_generation_call.partial_image":
+				b64 := strings.TrimSpace(gjson.GetBytes(data, "partial_image_b64").String())
+				if b64 == "" {
+					continue
 				}
+				eventName := streamPrefix + ".partial_image"
+				payload := buildImageStreamPayload(eventName, responseFormat, imageCallResult{
+					Result:       b64,
+					OutputFormat: strings.TrimSpace(gjson.GetBytes(data, "output_format").String()),
+				}, gjson.GetBytes(data, "partial_image_index").Int(), nil)
+				writeErr = writeEvent(eventName, payload)
+				result.writeErr = writeErr
+				wroteAny = true
+				result.wroteDownstream = true
+				if writeErr != nil {
+					keepReading = false
+				}
+			case "response.output_item.done":
+				item := gjson.GetBytes(data, "item")
+				if parsed, ok := parseImageCallResultFromItem(item); ok {
+					if idx := gjson.GetBytes(data, "output_index"); idx.Exists() {
+						itemsByIndex[idx.Int()] = parsed
+					} else {
+						fallbackItems = append(fallbackItems, parsed)
+					}
+				}
+			case "response.completed":
+				gotTerminal = true
+				result.sawRetryBarrier = true
+				usage = extractUsage(data)
+				results, _, usageRaw, _, err := extractImagesFromResponsesCompleted(data)
+				if err != nil {
+					keepReading = writeStreamFailure(err.Error())
+					break
+				}
+				if len(results) == 0 {
+					results = sortedImageStreamItems(itemsByIndex, fallbackItems)
+				}
+				if len(results) == 0 {
+					keepReading = writeStreamFailure("upstream did not return image output")
+					break
+				}
+				eventName := streamPrefix + ".completed"
+				for _, img := range results {
+					payload := buildImageStreamPayload(eventName, responseFormat, img, 0, usageRaw)
+					if err := writeEvent(eventName, payload); err != nil {
+						writeErr = err
+						result.writeErr = err
+						keepReading = false
+						break
+					}
+					wroteAny = true
+					result.wroteDownstream = true
+				}
+				keepReading = false
+			case "response.failed":
+				gotTerminal = true
+				result.sawRetryBarrier = true
+				msg := strings.TrimSpace(gjson.GetBytes(data, "response.error.message").String())
+				if msg == "" {
+					msg = "Codex upstream error"
+				}
+				keepReading = writeStreamFailure(msg)
+			case "error":
+				result.sawRetryBarrier = true
+				msg := strings.TrimSpace(gjson.GetBytes(data, "error.message").String())
+				if msg == "" {
+					msg = strings.TrimSpace(gjson.GetBytes(data, "message").String())
+				}
+				if msg == "" {
+					msg = "Codex upstream error"
+				}
+				keepReading = writeStreamFailure(msg)
 			}
-		case "response.completed":
-			gotTerminal = true
-			usage = extractUsage(data)
-			results, _, usageRaw, _, err := extractImagesFromResponsesCompleted(data)
-			if err != nil {
-				return writeStreamFailure(err.Error())
-			}
-			if len(results) == 0 {
-				results = sortedImageStreamItems(itemsByIndex, fallbackItems)
-			}
-			if len(results) == 0 {
-				return writeStreamFailure("upstream did not return image output")
-			}
-			eventName := streamPrefix + ".completed"
-			for _, img := range results {
-				payload := buildImageStreamPayload(eventName, responseFormat, img, 0, usageRaw)
-				if err := writeEvent(eventName, payload); err != nil {
+		case <-keepAliveC:
+			keepAliveC = nil
+			if !wroteAny && !c.Writer.Written() {
+				if err := writeKeepAlive(); err != nil {
 					writeErr = err
-					return false
+					result.writeErr = err
+					keepReading = false
+					break
 				}
 				wroteAny = true
+				result.wroteDownstream = true
 			}
-			return false
-		case "response.failed":
-			gotTerminal = true
-			msg := strings.TrimSpace(gjson.GetBytes(data, "response.error.message").String())
-			if msg == "" {
-				msg = "Codex upstream error"
+		case <-c.Request.Context().Done():
+			readErr = c.Request.Context().Err()
+			keepReading = false
+			if closer, ok := body.(io.Closer); ok {
+				_ = closer.Close()
 			}
-			return writeStreamFailure(msg)
 		}
-		return true
-	})
+	}
 
 	attemptDuration := int(time.Since(start).Milliseconds())
 	totalDuration := int(time.Since(requestStartedAt).Milliseconds())
@@ -905,26 +1008,52 @@ func (h *Handler) forwardImageStream(c *gin.Context, body io.Reader, responseFor
 	logUpstreamAttemptResult(c, endpoint, 1, account, "", outcome.logStatusCode, attemptDuration, requestStartedAt, "")
 
 	if writeErr != nil {
-		return wroteAny, writeErr
+		return result, writeErr
 	}
 	if streamFailureMessage != "" {
-		return wroteAny, fmt.Errorf("upstream image request failed: %s", streamFailureMessage)
+		return result, fmt.Errorf("upstream image request failed: %s", streamFailureMessage)
 	}
 	if readErr != nil {
 		if wroteAny {
 			_ = writeImageStreamError(writeEvent, http.StatusBadGateway, "upstream stream read failed: "+readErr.Error())
-			return wroteAny, readErr
+			result.wroteDownstream = true
+			return result, readErr
 		}
-		return wroteAny, readErr
+		return result, readErr
 	}
 	if !gotTerminal {
 		err := fmt.Errorf("upstream stream closed before response.completed")
 		if wroteAny {
 			_ = writeImageStreamError(writeEvent, http.StatusBadGateway, err.Error())
+			result.wroteDownstream = true
 		}
-		return wroteAny, err
+		return result, err
 	}
-	return wroteAny, nil
+	return result, nil
+}
+
+func isImageStreamRetryBarrierEvent(eventType string, data []byte) bool {
+	eventType = strings.ToLower(strings.TrimSpace(eventType))
+	if eventType == "" {
+		return false
+	}
+	if eventType == "response.completed" || eventType == "response.failed" || eventType == "error" {
+		return true
+	}
+	if strings.Contains(eventType, "image_generation_call") || strings.Contains(eventType, "partial_image") || strings.Contains(eventType, "error") {
+		return true
+	}
+	if item := gjson.GetBytes(data, "item"); item.Exists() && item.Get("type").String() == "image_generation_call" {
+		return true
+	}
+	if output := gjson.GetBytes(data, "response.output"); output.IsArray() {
+		for _, item := range output.Array() {
+			if item.Get("type").String() == "image_generation_call" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func writeImageStreamError(writeEvent func(string, []byte) error, status int, message string) error {

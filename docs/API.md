@@ -32,7 +32,7 @@ Codex2API 提供兼容 OpenAI 风格的 API 接口，同时包含完整的管理
 
 ### API Key 认证
 
-公共 API (`/v1/*`) 需要 API Key 进行认证；`GET /health` 是健康检查例外，不需要认证。
+配置了 API Key 时，代理入口需要 API Key 进行认证，包括 `/v1/*`、根路径兼容端点（如 `/chat/completions`、`/responses`、`/images/generations`）以及 `/backend-api/codex/*` 兼容别名。`GET /health` 是健康检查例外，不需要认证。
 
 **请求头:**
 ```http
@@ -41,7 +41,7 @@ Authorization: Bearer <API_KEY>
 
 **配置方式:**
 1. 通过管理后台 `/admin/settings` 页面配置
-2. 如果没有配置任何 API Key，则 `/v1/*` 接口跳过鉴权（开发模式）
+2. 未配置任何 API Key 时，代理入口跳过鉴权（开发模式）
 
 ### Admin Secret 认证
 
@@ -79,7 +79,7 @@ Authorization: Bearer <ADMIN_SECRET>
 {
   "model": "gpt-5.4",
   "messages": [
-    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "developer", "content": "You are a helpful assistant."},
     {"role": "user", "content": "Hello!"}
   ],
   "stream": false,
@@ -93,7 +93,7 @@ Authorization: Bearer <ADMIN_SECRET>
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | model | string | 是 | 模型名称，见 [支持模型](#支持模型) |
-| messages | array | 是 | 消息列表 |
+| messages | array | 是 | 消息列表，`role` 支持 `system`、`developer`、`user`、`assistant`、`tool`；`system` 会按 Codex 语义转换为 developer |
 | stream | boolean | 否 | 是否启用流式响应，默认 false |
 | reasoning_effort | string | 否 | 推理强度: low/medium/high |
 | service_tier | string | 否 | 服务等级: fast/auto |

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,79 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
 )
+
+func TestPrepareResponsesWebsocketCodexBodyReturnsExpandedInputForCache(t *testing.T) {
+	prevID := "resp-ws-expanded-input-test"
+	setResponseCache(prevID, []json.RawMessage{
+		json.RawMessage(`{"type":"message","id":"cached-user"}`),
+	})
+
+	body, expandedInputRaw, _, _, err := prepareResponsesWebsocketCodexBody(
+		[]byte(`{"model":"gpt-5.4","previous_response_id":"`+prevID+`","input":[{"type":"message","id":"current-user"}]}`),
+		"gpt-5.4",
+	)
+	if err != nil {
+		t.Fatalf("prepare body: %v", err)
+	}
+	if expandedInputRaw == prevID {
+		t.Fatalf("expandedInputRaw should be expanded input JSON, got previous_response_id %q", expandedInputRaw)
+	}
+
+	expanded := gjson.Parse(expandedInputRaw).Array()
+	if len(expanded) != 2 {
+		t.Fatalf("expanded input len = %d, want 2; expanded=%s body=%s", len(expanded), expandedInputRaw, string(body))
+	}
+	if expanded[0].Get("id").String() != "cached-user" || expanded[1].Get("id").String() != "current-user" {
+		t.Fatalf("unexpected expanded input order: %s", expandedInputRaw)
+	}
+	if got := gjson.GetBytes(body, "input").Raw; got != expandedInputRaw {
+		t.Fatalf("expandedInputRaw should match prepared body input; got %s want %s", expandedInputRaw, got)
+	}
+}
+
+func TestResponsesWebsocketPreparedSnapshotKeepsExpandedPreviousResponseForAppend(t *testing.T) {
+	prevID := "resp-ws-snapshot-expanded-input-test"
+	setResponseCache(prevID, []json.RawMessage{
+		json.RawMessage(`{"type":"message","id":"cached-user"}`),
+	})
+
+	raw := []byte(`{"model":"gpt-5.4","previous_response_id":"` + prevID + `","input":[{"type":"message","id":"current-user"}]}`)
+	_, expandedInputRaw, _, _, err := prepareResponsesWebsocketCodexBody(raw, "gpt-5.4")
+	if err != nil {
+		t.Fatalf("prepare body: %v", err)
+	}
+
+	snapshot := responsesWebsocketPreparedSnapshot(raw, expandedInputRaw)
+	if gjson.GetBytes(snapshot, "previous_response_id").Exists() {
+		t.Fatalf("snapshot should not retain previous_response_id: %s", string(snapshot))
+	}
+
+	normalized, _, err := normalizeResponsesWebsocketRequestMessage(
+		[]byte(`{"type":"response.append","input":[{"type":"message","id":"next-user"}]}`),
+		snapshot,
+		[]byte(`[{"type":"message","id":"assistant-1"}]`),
+	)
+	if err != nil {
+		t.Fatalf("normalize append: %v", err)
+	}
+
+	input := gjson.GetBytes(normalized, "input").Array()
+	if len(input) != 4 {
+		t.Fatalf("merged input len = %d, want 4; body=%s", len(input), string(normalized))
+	}
+	gotIDs := []string{
+		input[0].Get("id").String(),
+		input[1].Get("id").String(),
+		input[2].Get("id").String(),
+		input[3].Get("id").String(),
+	}
+	wantIDs := []string{"cached-user", "current-user", "assistant-1", "next-user"}
+	for i := range wantIDs {
+		if gotIDs[i] != wantIDs[i] {
+			t.Fatalf("merged input ids = %#v, want %#v; body=%s", gotIDs, wantIDs, string(normalized))
+		}
+	}
+}
 
 func TestNormalizeResponsesWebsocketRequestMessageAcceptsCreateAndPlainJSON(t *testing.T) {
 	createBody, last, err := normalizeResponsesWebsocketRequestMessage(
@@ -141,13 +215,14 @@ func TestResponsesWebsocketForwardsSSEDataPayloads(t *testing.T) {
 		MaxRetries:     0,
 		TestModel:      "gpt-5.4",
 	})
-	store.AddAccount(&auth.Account{
+	account := &auth.Account{
 		DBID:        1,
 		AccessToken: "access-token",
 		AccountID:   "account-id",
 		ExpiresAt:   time.Now().Add(time.Hour),
 		Status:      auth.StatusReady,
-	})
+	}
+	store.AddAccount(account)
 
 	router := gin.New()
 	handler := NewHandler(store, nil, nil, nil)
@@ -225,13 +300,14 @@ func TestResponsesWebsocketTreatsUpstreamErrorFrameAsTerminal(t *testing.T) {
 		MaxRetries:     0,
 		TestModel:      "gpt-5.4",
 	})
-	store.AddAccount(&auth.Account{
+	account := &auth.Account{
 		DBID:        1,
 		AccessToken: "access-token",
 		AccountID:   "account-id",
 		ExpiresAt:   time.Now().Add(time.Hour),
 		Status:      auth.StatusReady,
-	})
+	}
+	store.AddAccount(account)
 
 	router := gin.New()
 	handler := NewHandler(store, nil, nil, nil)
@@ -266,11 +342,130 @@ func TestResponsesWebsocketTreatsUpstreamErrorFrameAsTerminal(t *testing.T) {
 		t.Fatalf("first payload error.message = %q, want rate limited; payload=%s", got, string(first))
 	}
 
+	deadline := time.Now().Add(time.Second)
+	for {
+		_, reason, active := account.GetCooldownSnapshot()
+		if active && reason == "rate_limited" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("429 error frame did not mark account rate_limited, active=%v reason=%q", active, reason)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	if err := conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
 		t.Fatalf("set read deadline: %v", err)
 	}
 	_, second, err := conn.ReadMessage()
 	if err == nil {
 		t.Fatalf("unexpected second payload after terminal upstream error: %s", string(second))
+	}
+}
+
+func TestResponsesWebsocketSemanticFailuresRecordFailure(t *testing.T) {
+	tests := []struct {
+		name     string
+		sseBody  string
+		wantType string
+	}{
+		{
+			name:     "response failed",
+			sseBody:  "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\n",
+			wantType: "response.failed",
+		},
+		{
+			name:     "error frame",
+			sseBody:  "data: {\"type\":\"error\",\"status\":500,\"error\":{\"message\":\"boom\",\"type\":\"server_error\"}}\n\n",
+			wantType: "error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+
+			oldWebsocketExecuteFunc := WebsocketExecuteFunc
+			defer func() { WebsocketExecuteFunc = oldWebsocketExecuteFunc }()
+
+			WebsocketExecuteFunc = func(
+				ctx context.Context,
+				account *auth.Account,
+				requestBody []byte,
+				sessionID string,
+				proxyOverride string,
+				apiKey string,
+				deviceCfg *DeviceProfileConfig,
+				headers http.Header,
+			) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:       io.NopCloser(strings.NewReader(tt.sseBody)),
+				}, nil
+			}
+
+			store := auth.NewStore(nil, nil, &database.SystemSettings{
+				MaxConcurrency: 1,
+				MaxRetries:     0,
+				TestModel:      "gpt-5.4",
+			})
+			account := &auth.Account{
+				DBID:        1,
+				AccessToken: "access-token",
+				AccountID:   "account-id",
+				ExpiresAt:   time.Now().Add(time.Hour),
+				Status:      auth.StatusReady,
+			}
+			store.AddAccount(account)
+
+			router := gin.New()
+			handler := NewHandler(store, nil, nil, nil)
+			router.GET("/v1/responses", handler.ResponsesWebsocket)
+			server := httptest.NewServer(router)
+			defer server.Close()
+
+			wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+			headers := http.Header{}
+			headers.Set("Authorization", "Bearer sk-test")
+			conn, _, err := websocket.DefaultDialer.Dial(wsURL, headers)
+			if err != nil {
+				t.Fatalf("dial websocket: %v", err)
+			}
+			defer conn.Close()
+
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.4","input":"hello"}`)); err != nil {
+				t.Fatalf("write message: %v", err)
+			}
+
+			_, first, err := conn.ReadMessage()
+			if err != nil {
+				t.Fatalf("read terminal payload: %v", err)
+			}
+			if got := gjson.GetBytes(first, "type").String(); got != tt.wantType {
+				t.Fatalf("terminal payload type = %q, want %s; payload=%s", got, tt.wantType, string(first))
+			}
+
+			deadline := time.Now().Add(time.Second)
+			for {
+				account.Mu().RLock()
+				failureStreak := account.FailureStreak
+				successStreak := account.SuccessStreak
+				lastFailureAt := account.LastFailureAt
+				lastSuccessAt := account.LastSuccessAt
+				account.Mu().RUnlock()
+
+				if failureStreak > 0 && !lastFailureAt.IsZero() {
+					if successStreak != 0 || !lastSuccessAt.IsZero() {
+						t.Fatalf("semantic failure should not record success, successStreak=%d lastSuccessAt=%v", successStreak, lastSuccessAt)
+					}
+					return
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("semantic failure did not record request failure")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
 	}
 }

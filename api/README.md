@@ -16,11 +16,17 @@ This API uses URL path versioning (e.g., `/v1/`). The current version is v1.0.0.
 
 ### Authentication
 
-All API endpoints except `GET /health` require authentication via Bearer token in the Authorization header:
+When API keys are configured, all proxy entrypoints require authentication via
+Bearer token in the Authorization header. This includes `/v1/*`, root-path
+OpenAI-compatible aliases such as `/chat/completions` and `/responses`, and
+Codex CLI direct aliases under `/backend-api/codex/*`.
 
 ```
 Authorization: Bearer <API_KEY>
 ```
+
+If no API keys are configured, proxy authentication is skipped. `GET /health`
+is always a public health check and does not require an Authorization header.
 
 ### Upstream Header Compatibility
 
@@ -139,7 +145,7 @@ curl -N -X POST "<BASE_URL>/v1/images/generations" \
   }'
 ```
 
-Example SSE payload:
+Generation SSE payload:
 
 ```text
 event: image_generation.partial_image
@@ -147,9 +153,6 @@ data: {"type":"image_generation.partial_image","partial_image_index":0,"b64_json
 
 event: image_generation.completed
 data: {"type":"image_generation.completed","b64_json":"<BASE64_IMAGE>","usage":{"total_images":1}}
-
-event: image_edit.completed
-data: {"type":"image_edit.completed","url":"data:image/png;base64,<BASE64_IMAGE>","usage":{"total_images":1}}
 ```
 
 ### Responses WebSocket and Built-in Tools

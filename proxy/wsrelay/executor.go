@@ -3,6 +3,7 @@ package wsrelay
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,6 +28,8 @@ const (
 	// Codex WebSocket 端点
 	CodexWsEndpoint = "/responses"
 )
+
+var codexWebsocketBaseURL = proxy.CodexBaseURL
 
 // ==================== WebSocket 执行器 ====================
 
@@ -78,7 +81,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	wsBody := e.prepareWebsocketBody(requestBody, sessionID)
 
 	// 构建 WebSocket URL
-	httpURL := proxy.CodexBaseURL + CodexWsEndpoint
+	httpURL := codexWebsocketBaseURL + CodexWsEndpoint
 	wsURL, err := buildWebsocketURL(httpURL)
 	if err != nil {
 		return nil, fmt.Errorf("构建 WebSocket URL 失败: %w", err)
@@ -368,13 +371,15 @@ func (r *WsResponse) Close() error {
 	r.closed = true
 
 	// 移除等待请求
-	if r.conn != nil && r.conn.session != nil {
+	if r.conn != nil && r.conn.session != nil && r.pendingReq != nil {
 		r.conn.session.RemovePendingRequest(r.pendingReq.RequestID)
 	}
 
 	// 归还连接至连接池
-	if r.conn != nil {
+	if r.conn != nil && r.manager != nil {
 		r.manager.ReleaseConnection(r.conn)
+	} else if r.conn != nil {
+		return r.conn.Close()
 	}
 
 	return nil
@@ -460,10 +465,15 @@ func ExecuteRequestWebsocket(
 
 	// 将 WebSocket 响应包装为 http.Response
 	pr, pw := io.Pipe()
+	body := &websocketResponseBody{
+		reader: pr,
+		writer: pw,
+		wsResp: wsResp,
+	}
 	resp := &http.Response{
 		StatusCode: statusCode,
 		Header:     make(http.Header),
-		Body:       pr,
+		Body:       body,
 	}
 
 	// 从 HTTP 握手响应中复制头信息
@@ -500,4 +510,39 @@ func ExecuteRequestWebsocket(
 	}()
 
 	return resp, nil
+}
+
+type websocketResponseBody struct {
+	reader *io.PipeReader
+	writer *io.PipeWriter
+	wsResp *WsResponse
+	once   sync.Once
+	err    error
+}
+
+func (b *websocketResponseBody) Read(p []byte) (int, error) {
+	return b.reader.Read(p)
+}
+
+func (b *websocketResponseBody) Close() error {
+	b.once.Do(func() {
+		var errs []error
+		if b.wsResp != nil {
+			if err := b.wsResp.Close(); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+				errs = append(errs, err)
+			}
+		}
+		if b.writer != nil {
+			if err := b.writer.CloseWithError(io.ErrClosedPipe); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+				errs = append(errs, err)
+			}
+		}
+		if b.reader != nil {
+			if err := b.reader.CloseWithError(io.ErrClosedPipe); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+				errs = append(errs, err)
+			}
+		}
+		b.err = errors.Join(errs...)
+	})
+	return b.err
 }
