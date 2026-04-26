@@ -837,8 +837,6 @@ func prepareCompactRequestBody(rawBody []byte, model string) ([]byte, string) {
 	body := rawBody
 	body, _ = sjson.DeleteBytes(body, "stream")
 	body, _ = sjson.SetBytes(body, "model", model)
-	body, _ = sjson.SetBytes(body, "store", false)
-	body, _ = sjson.SetBytes(body, "parallel_tool_calls", true)
 	if !gjson.GetBytes(body, "include").Exists() {
 		body, _ = sjson.SetBytes(body, "include", []string{"reasoning.encrypted_content"})
 	}
@@ -868,7 +866,7 @@ func prepareCompactRequestBody(rawBody []byte, model string) ([]byte, string) {
 		"logprobs", "top_logprobs", "n", "seed", "stop", "user",
 		"logit_bias", "response_format", "serviceTier",
 		"stream_options", "reasoning_effort", "truncation", "context_management",
-		"disable_response_storage", "verbosity",
+		"disable_response_storage", "verbosity", "store", "parallel_tool_calls",
 	}
 	for _, field := range unsupportedFields {
 		body, _ = sjson.DeleteBytes(body, field)
