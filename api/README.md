@@ -72,10 +72,12 @@ Rate limits are returned in response headers:
 | `/v1/models` | GET | List available models (root-path alias: `/models`) |
 | `/v1/chat/completions` | POST | Create chat completion (root-path alias: `/chat/completions`) |
 | `/v1/responses` | POST | Create response (Codex native, root-path alias: `/responses`) |
-| `/v1/responses/compact` | POST | Compact compatibility alias (same as `/v1/responses`, root-path alias: `/responses/compact`) |
+| `/v1/responses/compact` | POST | Create compact response through Codex upstream `/responses/compact`; rejects `stream:true` (root-path alias: `/responses/compact`) |
+| `/backend-api/codex/responses` | POST | Codex CLI direct compatibility alias for `/v1/responses` |
+| `/backend-api/codex/responses/compact` | POST | Codex CLI direct compatibility alias for `/v1/responses/compact` |
 | `/health` | GET | Health check |
 
-If your client uses a `base_url` without `/v1`, the same OpenAI-compatible endpoints are also available on the root paths listed above.
+If your client uses a `base_url` without `/v1`, the same OpenAI-compatible endpoints are also available on the root paths listed above. Codex CLI style `chatgpt_base_url` clients may use the `/backend-api/codex/*` direct aliases.
 
 ### Model Support
 

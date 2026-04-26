@@ -703,11 +703,13 @@ paths:
 
   /responses/compact:
     post:
-      summary: Create compact response (compatibility alias)
+      summary: Create compact response
       description: |
-        Compatibility alias for clients that send context compaction requests
-        to `/responses/compact`.
-        This endpoint is handled the same way as `/responses`.
+        Handles context compaction requests by forwarding to the Codex upstream
+        `/responses/compact` endpoint and returning the non-streaming compact
+        response. Requests with `stream:true` are rejected with `400`.
+        Also available as `/backend-api/codex/responses/compact` for Codex CLI
+        direct base URL compatibility.
       operationId: createResponseCompact
       tags:
         - Responses

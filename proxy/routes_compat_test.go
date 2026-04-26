@@ -29,6 +29,8 @@ func TestRegisterRoutes_OpenAICompatibilityPaths(t *testing.T) {
 		{method: http.MethodPost, path: "/responses", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
 		{method: http.MethodPost, path: "/v1/responses/compact", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
 		{method: http.MethodPost, path: "/responses/compact", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
+		{method: http.MethodPost, path: "/backend-api/codex/responses", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
+		{method: http.MethodPost, path: "/backend-api/codex/responses/compact", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
 		{method: http.MethodPost, path: "/v1/images/generations", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
 		{method: http.MethodPost, path: "/images/generations", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},
 		{method: http.MethodPost, path: "/v1/images/edits", allowedCodes: map[int]struct{}{http.StatusUnauthorized: {}}},

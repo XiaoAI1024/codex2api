@@ -618,8 +618,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	registerOpenAIRoutes := func(group *gin.RouterGroup) {
 		group.POST("/chat/completions", h.ChatCompletions)
 		group.POST("/responses", h.Responses)
-		// 兼容部分客户端将 compact 请求打到 /responses/compact。
-		group.POST("/responses/compact", h.Responses)
+		group.POST("/responses/compact", h.ResponsesCompact)
 		group.POST("/images/generations", h.ImagesGenerations)
 		group.POST("/images/edits", h.ImagesEdits)
 		group.GET("/models", h.ListModels)
@@ -635,6 +634,13 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	compat := r.Group("")
 	compat.Use(authMW)
 	registerOpenAIRoutes(compat)
+
+	codexDirect := r.Group("/backend-api/codex")
+	codexDirect.Use(authMW)
+	{
+		codexDirect.POST("/responses", h.Responses)
+		codexDirect.POST("/responses/compact", h.ResponsesCompact)
+	}
 }
 
 // authMiddleware API Key 鉴权中间件（增强版，带安全日志）
@@ -815,6 +821,280 @@ func (h *Handler) applyUnauthorizedCooldown(account *auth.Account, upstreamStatu
 
 	log.Printf("账号 %d 收到封禁类错误(上游 %d/%s)，按 401 封禁处理", account.ID(), upstreamStatusCode, errCode)
 	h.store.MarkCooldown(account, 5*time.Minute, "unauthorized")
+}
+
+func normalizeCompactInstructions(body []byte) []byte {
+	instructions := gjson.GetBytes(body, "instructions")
+	if !instructions.Exists() || instructions.Type == gjson.Null {
+		body, _ = sjson.SetBytes(body, "instructions", "")
+	}
+	return body
+}
+
+func prepareCompactRequestBody(rawBody []byte, model string) ([]byte, string) {
+	body := rawBody
+	body, _ = sjson.DeleteBytes(body, "stream")
+	body, _ = sjson.SetBytes(body, "model", model)
+	body, _ = sjson.SetBytes(body, "store", false)
+	body, _ = sjson.SetBytes(body, "parallel_tool_calls", true)
+	if !gjson.GetBytes(body, "include").Exists() {
+		body, _ = sjson.SetBytes(body, "include", []string{"reasoning.encrypted_content"})
+	}
+	body = normalizeCompactInstructions(body)
+
+	inputResult := gjson.GetBytes(body, "input")
+	if inputResult.Exists() && inputResult.Type == gjson.String {
+		body, _ = sjson.SetBytes(body, "input", []map[string]string{
+			{"role": "user", "content": inputResult.String()},
+		})
+	}
+
+	if re := gjson.GetBytes(body, "reasoning_effort"); re.Exists() && !gjson.GetBytes(body, "reasoning.effort").Exists() {
+		body, _ = sjson.SetBytes(body, "reasoning.effort", re.String())
+	}
+	body = clampReasoningEffort(body, model)
+	reasoningEffort := gjson.GetBytes(body, "reasoning.effort").String()
+	body = sanitizeServiceTierForUpstream(body)
+	body = ensureToolDescriptions(body)
+	body = sanitizeToolSchemas(body)
+
+	unsupportedFields := []string{
+		"max_output_tokens", "max_tokens", "max_completion_tokens",
+		"temperature", "top_p", "frequency_penalty", "presence_penalty",
+		"logprobs", "top_logprobs", "n", "seed", "stop", "user",
+		"logit_bias", "response_format", "serviceTier",
+		"stream_options", "reasoning_effort", "truncation", "context_management",
+		"disable_response_storage", "verbosity",
+	}
+	for _, field := range unsupportedFields {
+		body, _ = sjson.DeleteBytes(body, field)
+	}
+	return body, reasoningEffort
+}
+
+// ResponsesCompact 处理 /v1/responses/compact，请求上游真实 /responses/compact。
+func (h *Handler) ResponsesCompact(c *gin.Context) {
+	rawBody, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
+		return
+	}
+	if len(rawBody) > security.MaxRequestBodySize {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"error": gin.H{"message": "请求体过大", "type": "invalid_request_error"},
+		})
+		return
+	}
+	if !gjson.ValidBytes(rawBody) {
+		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Request body must be valid JSON", api.ErrorTypeInvalidRequest))
+		return
+	}
+
+	streamResult := gjson.GetBytes(rawBody, "stream")
+	if streamResult.Type == gjson.True {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": gin.H{
+				"message": "Streaming not supported for compact responses",
+				"type":    "invalid_request_error",
+			},
+		})
+		return
+	}
+	if streamResult.Exists() {
+		rawBody, _ = sjson.DeleteBytes(rawBody, "stream")
+	}
+
+	validator := api.NewValidator(rawBody)
+	rules := api.ResponsesAPIValidationRules()
+	rules["model"] = append(rules["model"], api.ModelValidator(ListPublicModels()))
+	result := validator.ValidateRequest(rules)
+	if !result.Valid {
+		api.SendError(c, validator.ToAPIError())
+		return
+	}
+
+	model := gjson.GetBytes(rawBody, "model").String()
+	if err := security.ValidateModelName(model); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": gin.H{"message": "model 参数无效", "type": "invalid_request_error"},
+		})
+		return
+	}
+	if model == "" {
+		api.SendMissingFieldError(c, "model")
+		return
+	}
+	c.Set("x-model", model)
+	if IsImageOnlyModel(model) {
+		api.SendError(c, api.NewAPIError(
+			api.ErrCodeUnsupportedModel,
+			fmt.Sprintf("model '%s' is only supported on /v1/images/generations and /v1/images/edits", model),
+			api.ErrorTypeInvalidRequest,
+		))
+		return
+	}
+
+	rawBody = normalizeServiceTierField(rawBody)
+	serviceTier := extractServiceTier(rawBody)
+	if serviceTier != "" {
+		c.Set("x-service-tier", serviceTier)
+	}
+	codexBody, reasoningEffort := prepareCompactRequestBody(rawBody, model)
+	c.Set("x-reasoning-effort", reasoningEffort)
+
+	requestStartedAt := requestStartTime(c)
+	logRequestLifecycleStart(c, "/v1/responses/compact", model, false, reasoningEffort)
+
+	maxRetries := h.getMaxRetries()
+	var lastErr error
+	var lastStatusCode int
+	var lastBody []byte
+	var upstreamStageMs int64
+	excludeAccounts := make(map[int64]bool)
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		acquireStartedAt := time.Now()
+		account := h.acquireAccountForRequest(c, excludeAccounts)
+		attemptAcquireMs := int(time.Since(acquireStartedAt).Milliseconds())
+		if account == nil {
+			if lastStatusCode != 0 && len(lastBody) > 0 {
+				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+				return
+			}
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
+			})
+			return
+		}
+
+		start := time.Now()
+		proxyURL := h.store.NextProxy()
+		logRequestDispatch(c, "/v1/responses/compact", attempt+1, account, proxyURL, model, reasoningEffort, attemptAcquireMs)
+
+		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
+		apiKey = strings.TrimSpace(apiKey)
+
+		deviceCfg := h.deviceCfg
+		if deviceCfg == nil {
+			deviceCfg = DefaultDeviceProfileConfig()
+		}
+
+		downstreamHeaders := c.Request.Header.Clone()
+		sessionID := ResolveSessionID(c.GetHeader("Authorization"), rawBody)
+		resp, attemptTrace, reqErr := ExecuteRequestTracedToPath(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, "/responses/compact", false)
+		durationMs := int(time.Since(start).Milliseconds())
+		upstreamStageMs += int64(durationMs)
+		c.Set("x-upstream-stage-ms", upstreamStageMs)
+		statusCode := 0
+		if resp != nil {
+			statusCode = resp.StatusCode
+		}
+		if attemptTrace != nil && !attemptTrace.HeaderAt.IsZero() {
+			logUpstreamAttemptHeaders(c, "/v1/responses/compact", attempt+1, account, statusCode, attemptTrace, requestStartedAt)
+		}
+
+		if reqErr != nil {
+			if kind := classifyTransportFailure(reqErr); kind != "" {
+				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			}
+			logUpstreamAttemptResult(c, "/v1/responses/compact", attempt+1, account, proxyURL, 0, durationMs, requestStartedAt, reqErr.Error())
+			h.store.Release(account)
+			excludeAccounts[account.ID()] = true
+			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+				ErrorToGinResponse(c, reqErr)
+				return
+			}
+			lastErr = reqErr
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			h.persistUsageAndSettleFromResponse(account, resp)
+			errBody, _ := io.ReadAll(resp.Body)
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" {
+				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			}
+			resp.Body.Close()
+			logUpstreamAttemptResult(c, "/v1/responses/compact", attempt+1, account, proxyURL, resp.StatusCode, durationMs, requestStartedAt, fmt.Sprintf("http_%d", resp.StatusCode))
+			h.store.Release(account)
+			excludeAccounts[account.ID()] = true
+			logUpstreamError("/v1/responses/compact", resp.StatusCode, model, account.ID(), errBody)
+			h.logUsage(&database.UsageLogInput{
+				AccountID:        account.ID(),
+				Endpoint:         "/v1/responses/compact",
+				Model:            model,
+				StatusCode:       resp.StatusCode,
+				DurationMs:       durationMs,
+				ReasoningEffort:  reasoningEffort,
+				InboundEndpoint:  "/v1/responses/compact",
+				UpstreamEndpoint: "/responses/compact",
+				Stream:           false,
+				ServiceTier:      serviceTier,
+			})
+			h.applyCooldown(account, resp.StatusCode, errBody, resp)
+			lastStatusCode = resp.StatusCode
+			lastBody = errBody
+			if resp.StatusCode == http.StatusUnauthorized && isPermanentUnauthorizedError(errBody) {
+				log.Printf("账号 %d 返回永久 401(no_organization)，已从账号池剔除", account.ID())
+				h.forceDeleteAccount(account.ID(), "auto_clean_no_organization")
+			}
+			if isRetryableStatus(resp.StatusCode, errBody) && attempt < maxRetries {
+				continue
+			}
+			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
+			return
+		}
+
+		responseBody, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			h.store.Release(account)
+			excludeAccounts[account.ID()] = true
+			lastErr = readErr
+			continue
+		}
+
+		totalDuration := int(time.Since(requestStartedAt).Milliseconds())
+		resolvedServiceTier := resolveServiceTier(gjson.GetBytes(responseBody, "service_tier").String(), serviceTier)
+		c.Set("x-service-tier", resolvedServiceTier)
+		usage := extractUsage(responseBody)
+		logInput := &database.UsageLogInput{
+			AccountID:        account.ID(),
+			Endpoint:         "/v1/responses/compact",
+			Model:            model,
+			StatusCode:       http.StatusOK,
+			DurationMs:       totalDuration,
+			ReasoningEffort:  reasoningEffort,
+			InboundEndpoint:  "/v1/responses/compact",
+			UpstreamEndpoint: "/responses/compact",
+			Stream:           false,
+			ServiceTier:      resolvedServiceTier,
+		}
+		if usage != nil {
+			logInput.PromptTokens = usage.PromptTokens
+			logInput.CompletionTokens = usage.CompletionTokens
+			logInput.TotalTokens = usage.TotalTokens
+			logInput.InputTokens = usage.InputTokens
+			logInput.OutputTokens = usage.OutputTokens
+			logInput.ReasoningTokens = usage.ReasoningTokens
+			logInput.CachedTokens = usage.CachedTokens
+		}
+		h.logUsage(logInput)
+		h.persistUsageAndSettleFromResponse(account, resp)
+		h.store.ReportRequestSuccess(account, time.Duration(durationMs)*time.Millisecond)
+		logUpstreamAttemptResult(c, "/v1/responses/compact", attempt+1, account, proxyURL, http.StatusOK, durationMs, requestStartedAt, "")
+		h.store.Release(account)
+		c.Data(http.StatusOK, "application/json", responseBody)
+		return
+	}
+
+	if lastErr != nil {
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error": gin.H{"message": "上游请求失败: " + lastErr.Error(), "type": "upstream_error"},
+		})
+	} else if lastStatusCode != 0 {
+		h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+	}
 }
 
 // Responses 处理 /v1/responses 请求（原生透传，增强输入验证）

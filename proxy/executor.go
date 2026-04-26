@@ -155,6 +155,8 @@ const (
 	Originator   = "codex_cli_rs"
 )
 
+var codexBaseURL = CodexBaseURL
+
 // WebsocketExecuteFunc WebSocket 执行函数（由 wsrelay 包在 main.go 中注册，避免循环依赖）
 var WebsocketExecuteFunc func(
 	ctx context.Context,
@@ -262,6 +264,10 @@ func upstreamRequestWantsStream(requestBody []byte) bool {
 }
 
 func ExecuteRequestTraced(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, useWebsocket ...bool) (*http.Response, *UpstreamAttemptTrace, error) {
+	return ExecuteRequestTracedToPath(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers, "/responses", useWebsocket...)
+}
+
+func ExecuteRequestTracedToPath(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, upstreamPath string, useWebsocket ...bool) (*http.Response, *UpstreamAttemptTrace, error) {
 	// 检查是否使用 WebSocket
 	if ctx == nil {
 		ctx = context.Background()
@@ -318,7 +324,13 @@ func ExecuteRequestTraced(ctx context.Context, account *auth.Account, requestBod
 		requestBody, _ = sjson.SetBytes(requestBody, "prompt_cache_key", cacheKey)
 	}
 
-	endpoint := CodexBaseURL + "/responses"
+	if upstreamPath == "" {
+		upstreamPath = "/responses"
+	}
+	if !strings.HasPrefix(upstreamPath, "/") {
+		upstreamPath = "/" + upstreamPath
+	}
+	endpoint := strings.TrimRight(codexBaseURL, "/") + upstreamPath
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
 	if err != nil {

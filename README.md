@@ -201,11 +201,13 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 | --- | --- |
 | `POST /v1/chat/completions` | Chat Completions 风格入口（兼容根路径 `/chat/completions`） |
 | `POST /v1/responses` | Responses 风格入口（兼容根路径 `/responses`） |
-| `POST /v1/responses/compact` | Compact 兼容入口（等同 `/v1/responses`，兼容根路径 `/responses/compact`） |
+| `POST /v1/responses/compact` | Responses compact 入口，转发到 Codex 上游 `/responses/compact`；不支持 `stream:true`（兼容根路径 `/responses/compact`） |
+| `POST /backend-api/codex/responses` | Codex CLI direct 兼容入口，等同 `/v1/responses` |
+| `POST /backend-api/codex/responses/compact` | Codex CLI direct compact 兼容入口，等同 `/v1/responses/compact` |
 | `GET /v1/models` | 返回可用模型列表（兼容根路径 `/models`） |
 | `GET /health` | 健康检查 |
 
-如果客户端的 `base_url` 不包含 `/v1`，可以直接访问上述根路径兼容入口。
+如果客户端的 `base_url` 不包含 `/v1`，可以直接访问上述根路径兼容入口。若客户端按 Codex CLI 的 `chatgpt_base_url` 形式调用 `/backend-api/codex/*`，可使用 direct 兼容入口。
 
 ---
 

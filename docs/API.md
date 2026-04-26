@@ -143,7 +143,11 @@ data: [DONE]
 
 **说明:** Codex 原生 Responses 接口，直接透传，无需协议翻译。
 
-**兼容端点:** `POST /responses`、`POST /v1/responses/compact`、`POST /responses/compact`（`compact` 路径等同于 `/v1/responses`，用于兼容部分客户端 compact 请求）
+**兼容端点:** `POST /responses`、`POST /backend-api/codex/responses`
+
+**Compact 端点:** `POST /v1/responses/compact`、`POST /responses/compact`、`POST /backend-api/codex/responses/compact`
+
+`compact` 路径会请求 Codex 上游真实 `/responses/compact`，返回非流式 compact 响应；如果请求体包含 `stream:true`，会返回 `400 invalid_request_error`。
 
 **请求示例:**
 ```json
