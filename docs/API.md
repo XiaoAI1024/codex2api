@@ -32,7 +32,7 @@ Codex2API 提供兼容 OpenAI 风格的 API 接口，同时包含完整的管理
 
 ### API Key 认证
 
-公共 API (`/v1/*`) 需要 API Key 进行认证。
+公共 API (`/v1/*`) 需要 API Key 进行认证；`GET /health` 是健康检查例外，不需要认证。
 
 **请求头:**
 ```http
@@ -341,11 +341,11 @@ curl -N -X POST "<BASE_URL>/v1/images/generations" \
 **流式响应示例:**
 
 ```text
+event: image_generation.partial_image
 data: {"type":"image_generation.partial_image","partial_image_index":0,"b64_json":"<BASE64_IMAGE_CHUNK>"}
 
+event: image_generation.completed
 data: {"type":"image_generation.completed","b64_json":"<BASE64_IMAGE>","usage":{"total_images":1}}
-
-data: [DONE]
 ```
 
 #### 3.2 Image Edits
@@ -390,8 +390,8 @@ curl -X POST "<BASE_URL>/v1/images/edits" \
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | prompt | string | 是 | 编辑提示词 |
-| image | string/file/array | 是 | 输入图片；JSON 支持 URL、data URL、裸 base64 或对象数组；multipart 支持 `image` 或重复 `image[]` |
-| images | array | 否 | JSON 模式的附加输入图片 |
+| image | string/file/array | 条件必填 | 输入图片；JSON 模式需要 `image` 或 `images` 之一；multipart 模式需要 `image` 或重复 `image[]` |
+| images | array | 条件必填 | JSON 模式的输入图片；与 `image` 二选一 |
 | mask | string/object/file | 否 | 遮罩图片；JSON 支持 `mask` 或 `mask.image_url`，multipart 使用 `mask` 文件字段 |
 | model | string | 否 | 图像工具模型，默认 `gpt-image-2` |
 | input_fidelity | string | 否 | 输入保真度，例如 `high` |
@@ -403,11 +403,11 @@ curl -X POST "<BASE_URL>/v1/images/edits" \
 **流式响应示例:**
 
 ```text
+event: image_edit.partial_image
 data: {"type":"image_edit.partial_image","partial_image_index":0,"url":"data:image/png;base64,<BASE64_IMAGE_CHUNK>"}
 
+event: image_edit.completed
 data: {"type":"image_edit.completed","url":"data:image/png;base64,<BASE64_IMAGE>","usage":{"total_images":1}}
-
-data: [DONE]
 ```
 
 ### 4. List Models
@@ -435,6 +435,8 @@ data: [DONE]
 **端点:** `GET /health`
 
 **说明:** 健康检查端点，返回服务状态。
+
+**认证:** 不需要 `Authorization` 请求头。
 
 **响应示例:**
 ```json

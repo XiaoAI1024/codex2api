@@ -257,6 +257,8 @@ func convertMessagesToInput(messages gjson.Result) []byte {
 		switch role {
 		case "system":
 			role = "developer"
+		case "developer":
+			role = "developer"
 		case "assistant":
 			role = "assistant"
 		default:

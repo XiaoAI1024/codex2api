@@ -101,7 +101,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	if err := e.sendRequest(wc, wsBody, pr.RequestID); err != nil {
 		// 发送失败，尝试重连一次
 		wc.session.RemovePendingRequest(pr.RequestID)
-		e.manager.RemoveConnection(account.ID(), wsURL)
+		e.manager.ReleaseConnection(wc)
 
 		wc, err = e.manager.AcquireConnection(ctx, account, wsURL, headers, proxyOverride)
 		if err != nil {
@@ -142,8 +142,7 @@ func (e *Executor) prepareWebsocketBody(body []byte, sessionID string) []byte {
 		wsBody, _ = sjson.SetBytes(wsBody, "instructions", "")
 	}
 
-	// 2. 清理多余字段
-	wsBody, _ = sjson.DeleteBytes(wsBody, "previous_response_id")
+	// 2. 清理多余字段。保留 previous_response_id 以支持上游增量续写语义。
 	wsBody, _ = sjson.DeleteBytes(wsBody, "prompt_cache_retention")
 	wsBody, _ = sjson.DeleteBytes(wsBody, "safety_identifier")
 	wsBody, _ = sjson.DeleteBytes(wsBody, "disable_response_storage")
@@ -293,9 +292,12 @@ func (r *WsResponse) ReadStream(callback func(data []byte) bool) error {
 
 // handleMessage 处理单条 WebSocket 消息
 func (r *WsResponse) handleMessage(payload []byte, callback func(data []byte) bool) error {
-	// 检查是否是错误消息
-	if err := r.checkError(payload); err != nil {
-		return err
+	// 上游 type:error 是结构化终止帧，应原样下发，而不是折叠成读取错误。
+	if gjson.GetBytes(payload, "type").String() == "error" {
+		if !callback(payload) {
+			return io.EOF
+		}
+		return io.EOF
 	}
 
 	// 标准化完成事件类型

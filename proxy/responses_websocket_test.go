@@ -75,6 +75,37 @@ func TestNormalizeResponsesWebsocketRequestMessageMergesAppendInput(t *testing.T
 	}
 }
 
+func TestNormalizeResponsesWebsocketRequestMessagePreservesExplicitPreviousResponseID(t *testing.T) {
+	lastRequest := []byte(`{"model":"gpt-5.4","stream":true,"input":[{"type":"message","id":"msg-1"}],"instructions":"be terse"}`)
+	lastResponseOutput := []byte(`[{"type":"message","id":"assistant-1"}]`)
+
+	normalized, next, err := normalizeResponsesWebsocketRequestMessage(
+		[]byte(`{"type":"response.create","previous_response_id":"resp-prev","input":[{"type":"message","id":"msg-2"}]}`),
+		lastRequest,
+		lastResponseOutput,
+	)
+	if err != nil {
+		t.Fatalf("normalize create with previous_response_id: %v", err)
+	}
+
+	if prev := gjson.GetBytes(normalized, "previous_response_id").String(); prev != "resp-prev" {
+		t.Fatalf("previous_response_id = %q, want preserved; body=%s", prev, string(normalized))
+	}
+	input := gjson.GetBytes(normalized, "input").Array()
+	if len(input) != 1 || input[0].Get("id").String() != "msg-2" {
+		t.Fatalf("input should remain incremental when previous_response_id is present; body=%s", string(normalized))
+	}
+	if model := gjson.GetBytes(normalized, "model").String(); model != "gpt-5.4" {
+		t.Fatalf("model = %q, want inherited gpt-5.4; body=%s", model, string(normalized))
+	}
+	if instructions := gjson.GetBytes(normalized, "instructions").String(); instructions != "be terse" {
+		t.Fatalf("instructions = %q, want inherited instructions; body=%s", instructions, string(normalized))
+	}
+	if string(next) != string(normalized) {
+		t.Fatalf("next request snapshot should match normalized request")
+	}
+}
+
 func TestResponsesWebsocketForwardsSSEDataPayloads(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -161,5 +192,85 @@ func TestResponsesWebsocketForwardsSSEDataPayloads(t *testing.T) {
 	}
 	if got := gotHeaders.Get("Version"); got != "0.130.0" {
 		t.Fatalf("Version header = %q, want explicit downstream value", got)
+	}
+}
+
+func TestResponsesWebsocketTreatsUpstreamErrorFrameAsTerminal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	oldWebsocketExecuteFunc := WebsocketExecuteFunc
+	defer func() { WebsocketExecuteFunc = oldWebsocketExecuteFunc }()
+
+	WebsocketExecuteFunc = func(
+		ctx context.Context,
+		account *auth.Account,
+		requestBody []byte,
+		sessionID string,
+		proxyOverride string,
+		apiKey string,
+		deviceCfg *DeviceProfileConfig,
+		headers http.Header,
+	) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(
+				"data: {\"type\":\"error\",\"status\":429,\"error\":{\"message\":\"rate limited\",\"type\":\"rate_limit_error\"}}\n\n",
+			)),
+		}, nil
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency: 1,
+		MaxRetries:     0,
+		TestModel:      "gpt-5.4",
+	})
+	store.AddAccount(&auth.Account{
+		DBID:        1,
+		AccessToken: "access-token",
+		AccountID:   "account-id",
+		ExpiresAt:   time.Now().Add(time.Hour),
+		Status:      auth.StatusReady,
+	})
+
+	router := gin.New()
+	handler := NewHandler(store, nil, nil, nil)
+	router.GET("/v1/responses", handler.ResponsesWebsocket)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer sk-test")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, headers)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.4","input":"hello"}`)); err != nil {
+		t.Fatalf("write message: %v", err)
+	}
+
+	_, first, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read error payload: %v", err)
+	}
+	if got := gjson.GetBytes(first, "type").String(); got != "error" {
+		t.Fatalf("first payload type = %q, want error; payload=%s", got, string(first))
+	}
+	if got := int(gjson.GetBytes(first, "status").Int()); got != http.StatusTooManyRequests {
+		t.Fatalf("first payload status = %d, want 429; payload=%s", got, string(first))
+	}
+	if got := gjson.GetBytes(first, "error.message").String(); got != "rate limited" {
+		t.Fatalf("first payload error.message = %q, want rate limited; payload=%s", got, string(first))
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	_, second, err := conn.ReadMessage()
+	if err == nil {
+		t.Fatalf("unexpected second payload after terminal upstream error: %s", string(second))
 	}
 }

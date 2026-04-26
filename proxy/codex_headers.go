@@ -14,13 +14,6 @@ type codexRequestIdentity struct {
 	Version   string
 }
 
-// ShouldSuppressCodexVersionHeader 返回该模型是否应去掉 Version 请求头。
-// 当前仅对 gpt-5.5 家族生效；一旦命中，默认画像和下游显式 Version 都会被抑制。
-func ShouldSuppressCodexVersionHeader(model string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(model))
-	return strings.HasPrefix(normalized, "gpt-5.5")
-}
-
 // ResolveCodexHeaderIdentity 解析上游请求需要使用的 UA/Version。
 // 该函数用于在 HTTP 与 WebSocket 两条链路上统一请求身份策略。
 func ResolveCodexHeaderIdentity(account *auth.Account, apiKey string, downstreamHeaders http.Header, deviceCfg *DeviceProfileConfig) (userAgent string, version string) {

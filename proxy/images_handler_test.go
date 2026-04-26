@@ -2,17 +2,70 @@ package proxy
 
 import (
 	"bytes"
+	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
+	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
 
+func newImagesTestHandler(t *testing.T, accountCount int, maxRetries int) (*Handler, []*auth.Account) {
+	t.Helper()
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency: 10,
+		MaxRetries:     maxRetries,
+		TestModel:      "gpt-5.4",
+	})
+	store.SetMaxRetries(maxRetries)
+
+	accounts := make([]*auth.Account, 0, accountCount)
+	for i := 0; i < accountCount; i++ {
+		acc := &auth.Account{
+			DBID:        int64(i + 1),
+			AccessToken: "access-token",
+			AccountID:   fmt.Sprintf("account-%d", i+1),
+			ExpiresAt:   time.Now().Add(time.Hour),
+			Status:      auth.StatusReady,
+		}
+		store.AddAccount(acc)
+		accounts = append(accounts, acc)
+	}
+	return NewHandler(store, nil, nil, nil), accounts
+}
+
+func withImagesUpstream(t *testing.T, handler http.HandlerFunc) {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	oldBaseURL := codexBaseURL
+	codexBaseURL = server.URL
+	t.Cleanup(func() { codexBaseURL = oldBaseURL })
+}
+
+func performImageGenerationRequest(handler *Handler, body string) *httptest.ResponseRecorder {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/v1/images/generations", handler.ImagesGenerations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-test")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
 func TestBuildImagesRequest_Generation(t *testing.T) {
-	raw := []byte(`{"size":"1024x1024","response_format":"b64_json","n":2}`)
+	raw := []byte(`{"size":"1024x1024","response_format":"b64_json","input_fidelity":"high","n":2}`)
 	body := buildImagesRequest(raw, "draw a cat", nil, "gpt-image-2", "generate")
 
 	if got := gjson.GetBytes(body, "model").String(); got != defaultImagesMainModel {
@@ -50,6 +103,9 @@ func TestBuildImagesRequest_Generation(t *testing.T) {
 	}
 	if got := gjson.GetBytes(body, "tools.0.model").String(); got != "gpt-image-2" {
 		t.Fatalf("tool model mismatch: %q", got)
+	}
+	if gjson.GetBytes(body, "tools.0.input_fidelity").Exists() {
+		t.Fatalf("generation should not forward input_fidelity: %s", string(body))
 	}
 	if got := gjson.GetBytes(body, "input.0.content.0.type").String(); got != "input_text" {
 		t.Fatalf("content type mismatch: %q", got)
@@ -132,6 +188,30 @@ func TestParseMultipartImagesEditRequest(t *testing.T) {
 	}
 	if got := gjson.GetBytes(parsed.rawBody, "input_fidelity").String(); got != "high" {
 		t.Fatalf("raw input_fidelity = %q", got)
+	}
+}
+
+func TestParseJSONImagesEditRequest_ObjectURLsAndUnknownObjects(t *testing.T) {
+	parsed, err := parseJSONImagesEditRequest([]byte(`{
+		"prompt":"edit this",
+		"image":{"image_url":{"url":"https://example.com/nested.png"},"url":"https://example.com/fallback.png"},
+		"mask":{"url":"https://example.com/mask.png"}
+	}`))
+	if err != nil {
+		t.Fatalf("parse JSON edit object URLs: %v", err)
+	}
+	if len(parsed.images) != 1 || parsed.images[0] != "https://example.com/nested.png" {
+		t.Fatalf("images = %#v, want nested image_url.url", parsed.images)
+	}
+	if got := gjson.GetBytes(parsed.rawBody, "mask.image_url").String(); got != "https://example.com/mask.png" {
+		t.Fatalf("mask.image_url = %q, want mask.url", got)
+	}
+
+	if _, err := parseJSONImagesEditRequest([]byte(`{"prompt":"edit","image":{"foo":"bar"}}`)); err == nil {
+		t.Fatal("unknown image object should return an error")
+	}
+	if _, err := parseJSONImagesEditRequest([]byte(`{"prompt":"edit","image":"AAA","mask":{"foo":"bar"}}`)); err == nil {
+		t.Fatal("unknown mask object should return an error")
 	}
 }
 
@@ -240,6 +320,136 @@ func TestCollectCompletedImageEvent_LateCompletedWins(t *testing.T) {
 	}
 	if got := gjson.GetBytes(completed, "response.tool_usage.image_gen.total_images").Int(); got != 1 {
 		t.Fatalf("tool_usage.total_images = %d, want 1", got)
+	}
+}
+
+func TestCollectCompletedImageEvent_UsageOnlyCompletedDoesNotOverrideImage(t *testing.T) {
+	stream := strings.NewReader(strings.Join([]string{
+		`data: {"type":"response.completed","response":{"created_at":1710000000,"output":[{"type":"image_generation_call","result":"KEEP","output_format":"png"}],"tool_usage":{"image_gen":{"total_images":1}},"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+		"",
+		`data: {"type":"response.completed","response":{"created_at":1710000001,"output":[],"tool_usage":{"image_gen":{"total_images":2}},"usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}}}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n"))
+
+	completed, streamItems, failed, err := collectCompletedImageEvent(stream)
+	if err != nil {
+		t.Fatalf("collectCompletedImageEvent failed: %v", err)
+	}
+	if failed != "" {
+		t.Fatalf("failed message should be empty, got %q", failed)
+	}
+	if len(streamItems) != 0 {
+		t.Fatalf("streamItems should be empty, got %d", len(streamItems))
+	}
+
+	results, _, usageRaw, _, err := extractImagesFromResponsesCompleted(completed)
+	if err != nil {
+		t.Fatalf("extractImagesFromResponsesCompleted failed: %v", err)
+	}
+	if len(results) != 1 || results[0].Result != "KEEP" {
+		t.Fatalf("results = %+v, want KEEP from last completed with image", results)
+	}
+	if got := gjson.GetBytes(usageRaw, "total_images").Int(); got != 2 {
+		t.Fatalf("latest image usage total_images = %d, want 2", got)
+	}
+	usage := extractUsage(completed)
+	if usage == nil {
+		t.Fatal("latest response usage should be merged into retained completed event")
+	}
+	if usage.InputTokens != 11 || usage.OutputTokens != 7 || usage.TotalTokens != 18 {
+		t.Fatalf("usage = %+v, want latest usage from usage-only completed", usage)
+	}
+}
+
+func TestImagesStream_FirstFrameFailureReturnsJSONBadGateway(t *testing.T) {
+	withImagesUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+	})
+	handler, _ := newImagesTestHandler(t, 1, 0)
+
+	rec := performImageGenerationRequest(handler, `{"prompt":"draw a cat","stream":true}`)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Header().Get("Content-Type"), "application/json") {
+		t.Fatalf("content-type = %q, want JSON error response", rec.Header().Get("Content-Type"))
+	}
+	if got := gjson.GetBytes(rec.Body.Bytes(), "error.type").String(); got != "upstream_error" {
+		t.Fatalf("error.type = %q, want upstream_error; body=%s", got, rec.Body.String())
+	}
+}
+
+func TestImagesStream_ResponseFailedRecordsFailure(t *testing.T) {
+	withImagesUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\n"))
+	})
+	handler, accounts := newImagesTestHandler(t, 1, 0)
+
+	rec := performImageGenerationRequest(handler, `{"prompt":"draw a cat","stream":true}`)
+
+	if !strings.Contains(rec.Body.String(), "event: error") || !strings.Contains(rec.Body.String(), "boom") {
+		t.Fatalf("stream body should contain error event with upstream message, got %q", rec.Body.String())
+	}
+	acc := accounts[0]
+	acc.Mu().RLock()
+	failureStreak := acc.FailureStreak
+	successStreak := acc.SuccessStreak
+	lastFailureAt := acc.LastFailureAt
+	lastSuccessAt := acc.LastSuccessAt
+	acc.Mu().RUnlock()
+	if failureStreak == 0 || lastFailureAt.IsZero() {
+		t.Fatalf("response.failed should record request failure, failureStreak=%d lastFailureAt=%v", failureStreak, lastFailureAt)
+	}
+	if successStreak != 0 || !lastSuccessAt.IsZero() {
+		t.Fatalf("response.failed should not record success, successStreak=%d lastSuccessAt=%v", successStreak, lastSuccessAt)
+	}
+}
+
+func TestImagesNonStream_HTTP200SemanticFailuresDoNotRetryAcrossAccounts(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "response failed",
+			body: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\n",
+		},
+		{
+			name: "parse failure",
+			body: "data: {\"type\":\"response.completed\",\n\n",
+		},
+		{
+			name: "no image",
+			body: "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[]}]}}\n\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var upstreamCalls int32
+			withImagesUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&upstreamCalls, 1)
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(tc.body))
+			})
+			handler, _ := newImagesTestHandler(t, 3, 2)
+
+			rec := performImageGenerationRequest(handler, `{"prompt":"draw a cat","stream":false}`)
+
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
+			}
+			if got := atomic.LoadInt32(&upstreamCalls); got != 1 {
+				t.Fatalf("upstream calls = %d, want 1 to avoid duplicate generation/charging", got)
+			}
+		})
 	}
 }
 

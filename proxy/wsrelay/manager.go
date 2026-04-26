@@ -92,6 +92,9 @@ func (wc *WsConnection) Close() error {
 		if wc.onDisconnected != nil && wc.session != nil {
 			wc.onDisconnected(wc.session.AccountID)
 		}
+		if wc.session != nil {
+			wc.session.Close()
+		}
 		return wc.conn.Close()
 	}
 	return nil
@@ -247,6 +250,9 @@ func (m *Manager) evictExpired() {
 		wc := value.(*WsConnection)
 		if wc.IsExpired() || !wc.IsConnected() {
 			m.connections.Delete(key)
+			if wc.session != nil {
+				m.sessions.Delete(wc.session)
+			}
 			wc.Close()
 		}
 		return true
@@ -322,22 +328,17 @@ func (m *Manager) AcquireConnection(
 	headers http.Header,
 	proxyOverride string,
 ) (*WsConnection, error) {
-	key := m.poolKey(account.ID(), wsURL)
-
-	// 清理可能存在的旧连接（避免泄漏）
-	if v, ok := m.connections.LoadAndDelete(key); ok {
-		wc := v.(*WsConnection)
-		wc.Close()
-	}
-
 	// 始终创建新连接，避免多个请求复用同一个 websocket.Conn 导致并发读取
 	wc, err := m.createConnection(ctx, account, wsURL, headers, proxyOverride)
 	if err != nil {
 		return nil, err
 	}
 
-	// 存储新连接
-	m.connections.Store(key, wc)
+	// 使用连接对象自身作为 key，避免同账号同 URL 并发请求互相替换/关闭。
+	m.connections.Store(wc, wc)
+	if wc.session != nil {
+		m.sessions.Store(wc.session, wc.session)
+	}
 
 	// 调用连接回调
 	if fn := m.getOnConnected(); fn != nil {
@@ -378,19 +379,12 @@ func (m *Manager) createConnection(
 		}
 	}
 
-	// 创建会话（先关闭旧 session 避免泄漏）
-	sessionKey := m.poolKey(account.ID(), wsURL)
-	if oldSessionVal, ok := m.sessions.Load(sessionKey); ok {
-		oldSession := oldSessionVal.(*Session)
-		oldSession.Close()
-	}
+	// 每个上游请求使用独立会话，避免同账号并发请求共享读循环状态。
 	session := NewSession(account.ID(), m)
-	m.sessions.Store(sessionKey, session)
 
 	// 拨号连接
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
 	if err != nil {
-		m.sessions.Delete(sessionKey)
 		session.Close()
 		return nil, fmt.Errorf("websocket handshake failed: %w", err)
 	}
@@ -417,16 +411,25 @@ func (m *Manager) ReleaseConnection(wc *WsConnection) {
 		return
 	}
 	wc.Touch()
+	m.connections.Delete(wc)
+	if wc.session != nil {
+		m.sessions.Delete(wc.session)
+	}
+	_ = wc.Close()
 }
 
 // RemoveConnection 移除连接
 func (m *Manager) RemoveConnection(accountID int64, wsURL string) {
-	key := m.poolKey(accountID, wsURL)
-	if v, ok := m.connections.LoadAndDelete(key); ok {
-		wc := v.(*WsConnection)
+	m.connections.Range(func(key, value any) bool {
+		wc := value.(*WsConnection)
+		if wc == nil || wc.session == nil || wc.session.AccountID != accountID || wc.URL != wsURL || wc.IsConnected() {
+			return true
+		}
+		m.connections.Delete(key)
+		m.sessions.Delete(wc.session)
 		wc.Close()
-	}
-	m.sessions.Delete(key)
+		return true
+	})
 }
 
 // poolKey 生成连接池键
@@ -436,10 +439,16 @@ func (m *Manager) poolKey(accountID int64, wsURL string) string {
 
 // GetSession 获取会话
 func (m *Manager) GetSession(accountID int64, wsURL string) (*Session, bool) {
-	if v, ok := m.sessions.Load(m.poolKey(accountID, wsURL)); ok {
-		return v.(*Session), true
-	}
-	return nil, false
+	var found *Session
+	m.connections.Range(func(_, value any) bool {
+		wc := value.(*WsConnection)
+		if wc != nil && wc.session != nil && wc.session.AccountID == accountID && wc.URL == wsURL {
+			found = wc.session
+			return false
+		}
+		return true
+	})
+	return found, found != nil
 }
 
 // ConnectionCount 获取连接数量
@@ -491,7 +500,10 @@ func (m *Manager) SendHeartbeat(wc *WsConnection) error {
 	if err != nil {
 		log.Printf("WebSocket Ping 失败 (account %d): %v", wc.session.AccountID, err)
 		wc.Close()
-		m.connections.Delete(m.poolKey(wc.session.AccountID, wc.URL))
+		m.connections.Delete(wc)
+		if wc.session != nil {
+			m.sessions.Delete(wc.session)
+		}
 		return err
 	}
 	return nil

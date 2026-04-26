@@ -16,7 +16,7 @@ This API uses URL path versioning (e.g., `/v1/`). The current version is v1.0.0.
 
 ### Authentication
 
-All API endpoints require authentication via Bearer token in the Authorization header:
+All API endpoints except `GET /health` require authentication via Bearer token in the Authorization header:
 
 ```
 Authorization: Bearer <API_KEY>
@@ -84,7 +84,7 @@ Rate limits are returned in response headers:
 | `/backend-api/codex/responses/compact` | POST | Codex CLI direct compatibility alias for `/v1/responses/compact` |
 | `/v1/images/generations` | POST | Generate images (root-path alias: `/images/generations`) |
 | `/v1/images/edits` | POST | Edit images with JSON or multipart form data (root-path alias: `/images/edits`) |
-| `/health` | GET | Health check |
+| `/health` | GET | Health check; no Authorization header required |
 
 If your client uses a `base_url` without `/v1`, the same OpenAI-compatible endpoints are also available on the root paths listed above. Codex CLI style `chatgpt_base_url` clients may use the `/backend-api/codex/*` direct aliases.
 
@@ -94,9 +94,9 @@ If your client uses a `base_url` without `/v1`, the same OpenAI-compatible endpo
 
 - Default image tool model is `gpt-image-2`.
 - Generation accepts JSON payloads with `prompt`, `model`, `size`, `quality`, `background`, `output_format`, `output_compression`, `moderation`, `partial_images`, `response_format`, and `stream`.
-- Edits accept JSON payloads or `multipart/form-data`; multipart supports `image`, repeated `image[]`, `mask`, `prompt`, `model`, `input_fidelity`, and the same output options as generations.
+- Edits accept JSON payloads or `multipart/form-data`; JSON requires one of `image` or `images`, while multipart requires `image` or repeated `image[]`. Multipart also supports `mask`, `prompt`, `model`, `input_fidelity`, and the same output options as generations.
 - `response_format` can be `b64_json` or `url`. URL mode may return a data URL.
-- `stream:true` returns `text/event-stream` with events such as `image_generation.partial_image`, `image_generation.completed`, `image_edit.partial_image`, and `image_edit.completed`, followed by `data: [DONE]`.
+- `stream:true` returns `text/event-stream` with named SSE events such as `image_generation.partial_image`, `image_generation.completed`, `image_edit.partial_image`, and `image_edit.completed`. Treat the completed/error event or stream close as the image-stream terminal condition.
 
 JSON generation example:
 
@@ -142,11 +142,14 @@ curl -N -X POST "<BASE_URL>/v1/images/generations" \
 Example SSE payload:
 
 ```text
+event: image_generation.partial_image
 data: {"type":"image_generation.partial_image","partial_image_index":0,"b64_json":"<BASE64_IMAGE_CHUNK>"}
 
+event: image_generation.completed
 data: {"type":"image_generation.completed","b64_json":"<BASE64_IMAGE>","usage":{"total_images":1}}
 
-data: [DONE]
+event: image_edit.completed
+data: {"type":"image_edit.completed","url":"data:image/png;base64,<BASE64_IMAGE>","usage":{"total_images":1}}
 ```
 
 ### Responses WebSocket and Built-in Tools

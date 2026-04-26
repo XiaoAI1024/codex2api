@@ -95,6 +95,95 @@ func TestPrepareCompactRequestBodyNormalizesBuiltinToolsAndRoles(t *testing.T) {
 	}
 }
 
+func TestResponsesCompactDoesNotAddImageGenerationTool(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var gotPath string
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response.compaction","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`))
+	}))
+	defer server.Close()
+
+	oldBaseURL := codexBaseURL
+	codexBaseURL = server.URL
+	defer func() { codexBaseURL = oldBaseURL }()
+
+	r := gin.New()
+	store := auth.NewStore(nil, nil, nil)
+	store.AddAccount(&auth.Account{DBID: 101, AccessToken: "access-token", AccountID: "account-id", PlanType: "plus"})
+	h := NewHandler(store, nil, nil, nil)
+	h.configKeys = map[string]bool{"sk-test": true}
+	h.RegisterRoutes(r)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"gpt-5.4","input":"hello","tools":[{"type":"web_search"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if gotPath != "/responses/compact" {
+		t.Fatalf("upstream path = %q, want /responses/compact", gotPath)
+	}
+	for _, tool := range gjson.GetBytes(gotBody, "tools").Array() {
+		if tool.Get("type").String() == "image_generation" {
+			t.Fatalf("compact body should not include image_generation tool: %s", string(gotBody))
+		}
+	}
+	if got := gjson.GetBytes(gotBody, "tools.0.type").String(); got != "web_search" {
+		t.Fatalf("tools.0.type = %q, want web_search; body=%s", got, string(gotBody))
+	}
+}
+
+func TestResponsesAddsImageGenerationTool(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var gotPath string
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n"))
+	}))
+	defer server.Close()
+
+	oldBaseURL := codexBaseURL
+	codexBaseURL = server.URL
+	defer func() { codexBaseURL = oldBaseURL }()
+
+	r := gin.New()
+	store := auth.NewStore(nil, nil, nil)
+	store.AddAccount(&auth.Account{DBID: 102, AccessToken: "access-token", AccountID: "account-id", PlanType: "plus"})
+	h := NewHandler(store, nil, nil, nil)
+	h.configKeys = map[string]bool{"sk-test": true}
+	h.RegisterRoutes(r)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.4","input":"hello","tools":[{"type":"web_search"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if gotPath != "/responses" {
+		t.Fatalf("upstream path = %q, want /responses", gotPath)
+	}
+	if got := gjson.GetBytes(gotBody, "tools.1.type").String(); got != "image_generation" {
+		t.Fatalf("tools.1.type = %q, want image_generation; body=%s", got, string(gotBody))
+	}
+}
+
 func TestExecuteRequestTracedToPathUsesCompactEndpoint(t *testing.T) {
 	var gotPath string
 	var gotBody []byte

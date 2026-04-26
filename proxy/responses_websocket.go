@@ -22,6 +22,7 @@ import (
 const (
 	responsesWebsocketRequestCreate  = "response.create"
 	responsesWebsocketRequestAppend  = "response.append"
+	responsesWebsocketEventError     = "error"
 	responsesWebsocketEventCompleted = "response.completed"
 	responsesWebsocketEventFailed    = "response.failed"
 )
@@ -142,6 +143,28 @@ func normalizeResponsesWebsocketSubsequentRequest(rawJSON []byte, lastRequest []
 	nextInput := gjson.GetBytes(rawJSON, "input")
 	if !nextInput.Exists() || !nextInput.IsArray() {
 		return nil, lastRequest, fmt.Errorf("websocket request requires array field: input")
+	}
+
+	if strings.TrimSpace(gjson.GetBytes(rawJSON, "previous_response_id").String()) != "" {
+		normalized, err := sjson.DeleteBytes(rawJSON, "type")
+		if err != nil {
+			normalized = bytes.Clone(rawJSON)
+		}
+		if !gjson.GetBytes(normalized, "model").Exists() {
+			if model := strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String()); model != "" {
+				normalized, _ = sjson.SetBytes(normalized, "model", model)
+			}
+		}
+		if !gjson.GetBytes(normalized, "instructions").Exists() {
+			if instructions := gjson.GetBytes(lastRequest, "instructions"); instructions.Exists() {
+				normalized, _ = sjson.SetRawBytes(normalized, "instructions", []byte(instructions.Raw))
+			}
+		}
+		normalized, _ = sjson.SetBytes(normalized, "stream", true)
+		if strings.TrimSpace(gjson.GetBytes(normalized, "model").String()) == "" {
+			return nil, lastRequest, fmt.Errorf("missing model in websocket request")
+		}
+		return normalized, bytes.Clone(normalized), nil
 	}
 
 	mergedInput, err := mergeResponsesWebsocketJSONArrayRaw(gjson.GetBytes(lastRequest, "input").Raw, normalizeResponsesWebsocketJSONArrayRaw(lastResponseOutput))
@@ -435,7 +458,7 @@ func (h *Handler) forwardResponsesWebsocketStream(
 			cacheCompletedResponse([]byte(expandedInputRaw), data)
 			gotTerminal = true
 		}
-		if eventType == responsesWebsocketEventFailed {
+		if eventType == responsesWebsocketEventFailed || eventType == responsesWebsocketEventError {
 			gotTerminal = true
 		}
 
@@ -473,7 +496,7 @@ func (h *Handler) forwardResponsesWebsocketStream(
 }
 
 func isResponsesWebsocketTerminalEvent(eventType string) bool {
-	return eventType == responsesWebsocketEventCompleted || eventType == responsesWebsocketEventFailed
+	return eventType == responsesWebsocketEventCompleted || eventType == responsesWebsocketEventFailed || eventType == responsesWebsocketEventError
 }
 
 func (h *Handler) logResponsesWebsocketUsage(account *auth.Account, model string, statusCode int, durationMs int, firstTokenMs int, reasoningEffort string, serviceTier string, usage *UsageInfo) {

@@ -195,22 +195,15 @@ func parseJSONImagesEditRequest(rawBody []byte) (imagesEditRequest, error) {
 	}
 
 	var images []string
-	collectImage := func(item gjson.Result) {
-		switch {
-		case item.Type == gjson.String:
-			value := strings.TrimSpace(item.String())
-			if value != "" {
-				images = append(images, normalizeImageInput(value))
-			}
-		case item.IsObject():
-			for _, path := range []string{"image_url", "url", "image_url.url"} {
-				value := strings.TrimSpace(item.Get(path).String())
-				if value != "" {
-					images = append(images, normalizeImageInput(value))
-					return
-				}
-			}
+	collectImage := func(item gjson.Result) error {
+		value, ok, err := parseJSONImageInputValue(item, "image")
+		if err != nil {
+			return err
 		}
+		if ok {
+			images = append(images, value)
+		}
+		return nil
 	}
 	for _, field := range []string{"image", "images"} {
 		v := gjson.GetBytes(rawBody, field)
@@ -219,17 +212,27 @@ func parseJSONImagesEditRequest(rawBody []byte) (imagesEditRequest, error) {
 		}
 		if v.IsArray() {
 			for _, item := range v.Array() {
-				collectImage(item)
+				if err := collectImage(item); err != nil {
+					return imagesEditRequest{}, err
+				}
 			}
 			continue
 		}
-		collectImage(v)
+		if err := collectImage(v); err != nil {
+			return imagesEditRequest{}, err
+		}
 	}
 
-	if mask := strings.TrimSpace(gjson.GetBytes(rawBody, "mask.image_url").String()); mask != "" {
-		rawBody, _ = sjson.SetBytes(rawBody, "mask.image_url", normalizeImageInput(mask))
-	} else if mask := strings.TrimSpace(gjson.GetBytes(rawBody, "mask").String()); mask != "" {
-		rawBody, _ = sjson.SetBytes(rawBody, "mask.image_url", normalizeImageInput(mask))
+	var mask string
+	if maskValue := gjson.GetBytes(rawBody, "mask"); maskValue.Exists() {
+		parsedMask, ok, err := parseJSONImageInputValue(maskValue, "mask")
+		if err != nil {
+			return imagesEditRequest{}, err
+		}
+		if ok {
+			mask = parsedMask
+			rawBody, _ = sjson.SetBytes(rawBody, "mask.image_url", parsedMask)
+		}
 	}
 
 	return imagesEditRequest{
@@ -238,8 +241,39 @@ func parseJSONImagesEditRequest(rawBody []byte) (imagesEditRequest, error) {
 		imageModel:     imageModel,
 		responseFormat: responseFormat,
 		images:         images,
+		mask:           mask,
 		stream:         gjson.GetBytes(rawBody, "stream").Bool(),
 	}, nil
+}
+
+func parseJSONImageInputValue(item gjson.Result, fieldName string) (string, bool, error) {
+	if !item.Exists() {
+		return "", false, nil
+	}
+	if item.Type == gjson.String {
+		value := strings.TrimSpace(item.String())
+		if value == "" {
+			return "", false, nil
+		}
+		return normalizeImageInput(value), true, nil
+	}
+	if !item.IsObject() {
+		return "", false, fmt.Errorf("%s must be a string or an object", fieldName)
+	}
+
+	for _, path := range []string{"image_url.url", "image_url", "url"} {
+		candidate := item.Get(path)
+		if !candidate.Exists() || candidate.Type != gjson.String {
+			continue
+		}
+		value := strings.TrimSpace(candidate.String())
+		if value == "" {
+			continue
+		}
+		return normalizeImageInput(value), true, nil
+	}
+
+	return "", false, fmt.Errorf("%s object must contain image_url.url, image_url, or url", fieldName)
 }
 
 func parseMultipartImagesEditRequest(r *http.Request) (imagesEditRequest, error) {
@@ -388,7 +422,7 @@ func buildImagesRequest(rawBody []byte, prompt string, images []string, imageMod
 	tool := []byte(`{"type":"image_generation"}`)
 	tool, _ = sjson.SetBytes(tool, "action", action)
 	tool, _ = sjson.SetBytes(tool, "model", imageModel)
-	for _, field := range []string{"size", "quality", "background", "output_format", "output_compression", "moderation", "partial_images", "input_fidelity"} {
+	for _, field := range []string{"size", "quality", "background", "output_format", "output_compression", "moderation", "partial_images"} {
 		v := gjson.GetBytes(rawBody, field)
 		if !v.Exists() {
 			continue
@@ -396,6 +430,9 @@ func buildImagesRequest(rawBody []byte, prompt string, images []string, imageMod
 		tool, _ = sjson.SetRawBytes(tool, field, []byte(v.Raw))
 	}
 	if action == "edit" {
+		if v := gjson.GetBytes(rawBody, "input_fidelity"); v.Exists() {
+			tool, _ = sjson.SetRawBytes(tool, "input_fidelity", []byte(v.Raw))
+		}
 		if mask := strings.TrimSpace(gjson.GetBytes(rawBody, "mask.image_url").String()); mask != "" {
 			tool, _ = sjson.SetBytes(tool, "input_image_mask.image_url", mask)
 		}
@@ -483,11 +520,21 @@ func (h *Handler) executeImageEndpoint(c *gin.Context, endpoint, imageModel, res
 		}
 
 		if stream {
-			streamErr := h.forwardImageStream(c, resp.Body, responseFormat, streamPrefix, account, endpoint, imageModel, requestStartedAt, start)
+			wroteStreamBody, streamErr := h.forwardImageStream(c, resp.Body, responseFormat, streamPrefix, account, endpoint, imageModel, requestStartedAt, start)
 			resp.Body.Close()
 			h.persistUsageAndSettleFromResponse(account, resp)
 			h.store.Release(account)
 			if streamErr != nil {
+				if !wroteStreamBody && attempt < maxRetries {
+					excludeAccounts[account.ID()] = true
+					lastErr = streamErr
+					continue
+				}
+				if !wroteStreamBody && !c.Writer.Written() {
+					c.JSON(http.StatusBadGateway, gin.H{
+						"error": gin.H{"message": "上游请求失败: " + streamErr.Error(), "type": "upstream_error"},
+					})
+				}
 				return
 			}
 			return
@@ -497,42 +544,32 @@ func (h *Handler) executeImageEndpoint(c *gin.Context, endpoint, imageModel, res
 		resp.Body.Close()
 		h.persistUsageAndSettleFromResponse(account, resp)
 		if readErr != nil {
-			h.store.Release(account)
-			excludeAccounts[account.ID()] = true
-			lastErr = readErr
-			continue
+			h.finishImageNonStreamUpstreamFailure(c, account, endpoint, imageModel, requestStartedAt, start, readErr)
+			return
 		}
 		if failedMsg != "" {
-			h.store.Release(account)
-			excludeAccounts[account.ID()] = true
-			lastErr = fmt.Errorf("upstream image request failed: %s", failedMsg)
-			continue
+			h.finishImageNonStreamUpstreamFailure(c, account, endpoint, imageModel, requestStartedAt, start, fmt.Errorf("upstream image request failed: %s", failedMsg))
+			return
 		}
 
 		results, createdAt, usageRaw, firstMeta, parseErr := extractImagesFromResponsesCompleted(completed)
 		if parseErr != nil {
-			h.store.Release(account)
-			excludeAccounts[account.ID()] = true
-			lastErr = parseErr
-			continue
+			h.finishImageNonStreamUpstreamFailure(c, account, endpoint, imageModel, requestStartedAt, start, parseErr)
+			return
 		}
 		if len(results) == 0 && len(streamItems) > 0 {
 			results = streamItems
 			firstMeta = streamItems[0]
 		}
 		if len(results) == 0 {
-			h.store.Release(account)
-			excludeAccounts[account.ID()] = true
-			lastErr = fmt.Errorf("upstream did not return image output")
-			continue
+			h.finishImageNonStreamUpstreamFailure(c, account, endpoint, imageModel, requestStartedAt, start, fmt.Errorf("upstream did not return image output"))
+			return
 		}
 
 		payload, buildErr := buildImagesAPIResponse(results, createdAt, usageRaw, firstMeta, responseFormat)
 		if buildErr != nil {
-			h.store.Release(account)
-			excludeAccounts[account.ID()] = true
-			lastErr = buildErr
-			continue
+			h.finishImageNonStreamUpstreamFailure(c, account, endpoint, imageModel, requestStartedAt, start, buildErr)
+			return
 		}
 
 		logInput := &database.UsageLogInput{
@@ -577,8 +614,34 @@ func (h *Handler) executeImageEndpoint(c *gin.Context, endpoint, imageModel, res
 	})
 }
 
+func (h *Handler) finishImageNonStreamUpstreamFailure(c *gin.Context, account *auth.Account, endpoint string, imageModel string, requestStartedAt time.Time, start time.Time, err error) {
+	attemptDuration := int(time.Since(start).Milliseconds())
+	totalDuration := int(time.Since(requestStartedAt).Milliseconds())
+	if h != nil && h.store != nil {
+		h.store.ReportRequestFailure(account, "server", schedulerLatency(attemptDuration, 0))
+	}
+	h.logUsage(&database.UsageLogInput{
+		AccountID:        account.ID(),
+		Endpoint:         endpoint,
+		Model:            imageModel,
+		StatusCode:       http.StatusBadGateway,
+		DurationMs:       totalDuration,
+		InboundEndpoint:  endpoint,
+		UpstreamEndpoint: "/v1/responses",
+		Stream:           false,
+	})
+	if h != nil && h.store != nil {
+		h.store.Release(account)
+	}
+	c.JSON(http.StatusBadGateway, gin.H{
+		"error": gin.H{"message": "上游请求失败: " + err.Error(), "type": "upstream_error"},
+	})
+}
+
 func collectCompletedImageEvent(body io.Reader) ([]byte, []imageCallResult, string, error) {
 	var completedEvent []byte
+	var fallbackCompletedEvent []byte
+	var latestUsageEvent []byte
 	var failedMessage string
 	itemsByIndex := make(map[int64]imageCallResult)
 	fallbackItems := make([]imageCallResult, 0, 2)
@@ -587,8 +650,18 @@ func collectCompletedImageEvent(body io.Reader) ([]byte, []imageCallResult, stri
 		eventType := gjson.GetBytes(data, "type").String()
 		switch eventType {
 		case "response.completed":
-			// 取最后一个 completed，兼容 usage 晚到。
-			completedEvent = append(completedEvent[:0], data...)
+			eventData := append([]byte(nil), data...)
+			if completedEventHasUsage(eventData) {
+				latestUsageEvent = eventData
+			}
+			if completedEventHasImages(eventData) {
+				completedEvent = append(completedEvent[:0], eventData...)
+			} else {
+				fallbackCompletedEvent = append(fallbackCompletedEvent[:0], eventData...)
+			}
+			if len(completedEvent) > 0 && len(latestUsageEvent) > 0 {
+				completedEvent = mergeCompletedUsage(completedEvent, latestUsageEvent)
+			}
 		case "response.output_item.done":
 			item := gjson.GetBytes(data, "item")
 			if parsed, ok := parseImageCallResultFromItem(item); ok {
@@ -612,6 +685,12 @@ func collectCompletedImageEvent(body io.Reader) ([]byte, []imageCallResult, stri
 	if failedMessage != "" {
 		return nil, nil, failedMessage, nil
 	}
+	if len(completedEvent) == 0 && len(fallbackCompletedEvent) > 0 {
+		completedEvent = append(completedEvent[:0], fallbackCompletedEvent...)
+		if len(latestUsageEvent) > 0 {
+			completedEvent = mergeCompletedUsage(completedEvent, latestUsageEvent)
+		}
+	}
 	if len(completedEvent) == 0 {
 		return nil, nil, "", fmt.Errorf("upstream did not return response.completed")
 	}
@@ -632,21 +711,64 @@ func collectCompletedImageEvent(body io.Reader) ([]byte, []imageCallResult, stri
 	return completedEvent, streamItems, "", nil
 }
 
-func (h *Handler) forwardImageStream(c *gin.Context, body io.Reader, responseFormat string, streamPrefix string, account *auth.Account, endpoint string, imageModel string, requestStartedAt time.Time, start time.Time) error {
+func completedEventHasImages(payload []byte) bool {
+	output := gjson.GetBytes(payload, "response.output")
+	if !output.IsArray() {
+		return false
+	}
+	for _, item := range output.Array() {
+		if _, ok := parseImageCallResultFromItem(item); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func completedEventHasUsage(payload []byte) bool {
+	for _, path := range []string{"response.tool_usage.image_gen", "response.usage", "usage"} {
+		if usage := gjson.GetBytes(payload, path); usage.Exists() && usage.IsObject() {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeCompletedUsage(base []byte, usageEvent []byte) []byte {
+	if len(base) == 0 {
+		return append([]byte(nil), usageEvent...)
+	}
+	merged := append([]byte(nil), base...)
+	for _, path := range []string{"response.tool_usage.image_gen", "response.usage", "usage"} {
+		if usage := gjson.GetBytes(usageEvent, path); usage.Exists() && usage.IsObject() {
+			merged, _ = sjson.SetRawBytes(merged, path, []byte(usage.Raw))
+		}
+	}
+	return merged
+}
+
+func (h *Handler) forwardImageStream(c *gin.Context, body io.Reader, responseFormat string, streamPrefix string, account *auth.Account, endpoint string, imageModel string, requestStartedAt time.Time, start time.Time) (bool, error) {
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": gin.H{"message": "streaming not supported", "type": "server_error"},
 		})
-		return fmt.Errorf("streaming not supported")
+		return true, fmt.Errorf("streaming not supported")
 	}
 
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no")
+	headersPrepared := false
+	prepareHeaders := func() {
+		if headersPrepared {
+			return
+		}
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+		c.Header("X-Accel-Buffering", "no")
+		headersPrepared = true
+	}
 
 	writeEvent := func(eventName string, payload []byte) error {
+		prepareHeaders()
 		if eventName != "" {
 			if _, err := fmt.Fprintf(c.Writer, "event: %s\n", eventName); err != nil {
 				return err
@@ -664,9 +786,20 @@ func (h *Handler) forwardImageStream(c *gin.Context, body io.Reader, responseFor
 	var readErr error
 	gotTerminal := false
 	wroteAny := false
+	streamFailureMessage := ""
 	firstFrameRecorded := false
 	itemsByIndex := make(map[int64]imageCallResult)
 	fallbackItems := make([]imageCallResult, 0, 2)
+
+	writeStreamFailure := func(message string) bool {
+		streamFailureMessage = message
+		if err := writeImageStreamError(writeEvent, http.StatusBadGateway, message); err != nil {
+			writeErr = err
+			return false
+		}
+		wroteAny = true
+		return false
+	}
 
 	readErr = ReadSSEStream(body, func(data []byte) bool {
 		eventType := gjson.GetBytes(data, "type").String()
@@ -703,15 +836,13 @@ func (h *Handler) forwardImageStream(c *gin.Context, body io.Reader, responseFor
 			usage = extractUsage(data)
 			results, _, usageRaw, _, err := extractImagesFromResponsesCompleted(data)
 			if err != nil {
-				writeErr = writeImageStreamError(writeEvent, http.StatusBadGateway, err.Error())
-				return false
+				return writeStreamFailure(err.Error())
 			}
 			if len(results) == 0 {
 				results = sortedImageStreamItems(itemsByIndex, fallbackItems)
 			}
 			if len(results) == 0 {
-				writeErr = writeImageStreamError(writeEvent, http.StatusBadGateway, "upstream did not return image output")
-				return false
+				return writeStreamFailure("upstream did not return image output")
 			}
 			eventName := streamPrefix + ".completed"
 			for _, img := range results {
@@ -729,8 +860,7 @@ func (h *Handler) forwardImageStream(c *gin.Context, body io.Reader, responseFor
 			if msg == "" {
 				msg = "Codex upstream error"
 			}
-			writeErr = writeImageStreamError(writeEvent, http.StatusBadGateway, msg)
-			return false
+			return writeStreamFailure(msg)
 		}
 		return true
 	})
@@ -738,6 +868,14 @@ func (h *Handler) forwardImageStream(c *gin.Context, body io.Reader, responseFor
 	attemptDuration := int(time.Since(start).Milliseconds())
 	totalDuration := int(time.Since(requestStartedAt).Milliseconds())
 	outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+	if streamFailureMessage != "" {
+		outcome = streamOutcome{
+			logStatusCode:  http.StatusBadGateway,
+			failureKind:    "server",
+			failureMessage: "上游图片请求失败: " + streamFailureMessage,
+			penalize:       true,
+		}
+	}
 	if outcome.penalize {
 		recyclePooledClientForAccount(account)
 		h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(attemptDuration)*time.Millisecond)
@@ -767,23 +905,26 @@ func (h *Handler) forwardImageStream(c *gin.Context, body io.Reader, responseFor
 	logUpstreamAttemptResult(c, endpoint, 1, account, "", outcome.logStatusCode, attemptDuration, requestStartedAt, "")
 
 	if writeErr != nil {
-		return writeErr
+		return wroteAny, writeErr
+	}
+	if streamFailureMessage != "" {
+		return wroteAny, fmt.Errorf("upstream image request failed: %s", streamFailureMessage)
 	}
 	if readErr != nil {
 		if wroteAny {
 			_ = writeImageStreamError(writeEvent, http.StatusBadGateway, "upstream stream read failed: "+readErr.Error())
-			return readErr
+			return wroteAny, readErr
 		}
-		return readErr
+		return wroteAny, readErr
 	}
 	if !gotTerminal {
 		err := fmt.Errorf("upstream stream closed before response.completed")
 		if wroteAny {
 			_ = writeImageStreamError(writeEvent, http.StatusBadGateway, err.Error())
 		}
-		return err
+		return wroteAny, err
 	}
-	return nil
+	return wroteAny, nil
 }
 
 func writeImageStreamError(writeEvent func(string, []byte) error, status int, message string) error {

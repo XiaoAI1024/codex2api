@@ -120,13 +120,13 @@ sudo systemctl status codex2api --no-pager
 > **⚠️ 重要：升级前请先备份 PostgreSQL！**
 >
 > ```bash
-> pg_dump -h 127.0.0.1 -U codex2api -d codex2api > backup_$(date +%Y%m%d_%H%M%S).sql
+> pg_dump -h localhost -U codex2api -d codex2api > backup_$(date +%Y%m%d_%H%M%S).sql
 > ```
 >
 > 如果升级后数据异常，可通过以下命令恢复：
 >
 > ```bash
-> psql -h 127.0.0.1 -U codex2api -d codex2api < backup_xxx.sql
+> psql -h localhost -U codex2api -d codex2api < backup_xxx.sql
 > ```
 
 ### 本地开发模式
@@ -187,7 +187,7 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 
 ### API Key 与管理密钥
 
-- **对外 API Key**：以数据库中的 API Keys 为准。如果没有配置任何 Key，则 `/v1/*` 跳过鉴权。
+- **对外 API Key**：以数据库中的 API Keys 为准。如果没有配置任何 Key，则 `/v1/*` 跳过鉴权；`GET /health` 始终用于健康检查，不需要对外 API Key。
 - **管理后台 Admin Secret**：
   - 如果 `.env` 中设置了 `ADMIN_SECRET`，则优先使用环境变量。
   - 如果未设置 `ADMIN_SECRET`，则回退到数据库中的 `AdminSecret`。
@@ -209,13 +209,13 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 | `POST /v1/images/generations` | Images generation 入口（兼容根路径 `/images/generations`） |
 | `POST /v1/images/edits` | Images edits 入口，支持 JSON 与 `multipart/form-data`（兼容根路径 `/images/edits`） |
 | `GET /v1/models` | 返回可用模型列表（兼容根路径 `/models`） |
-| `GET /health` | 健康检查 |
+| `GET /health` | 健康检查，无需鉴权 |
 
 如果客户端的 `base_url` 不包含 `/v1`，可以直接访问上述根路径兼容入口。若客户端按 Codex CLI 的 `chatgpt_base_url` 形式调用 `/backend-api/codex/*`，可使用 direct 兼容入口。
 
 ### CLIProxyAPI 兼容要点
 
-- **Images**：`/v1/images/generations` 与 `/v1/images/edits` 默认使用 `gpt-image-2` 图像工具；`edits` 支持 JSON 输入，也支持 `multipart/form-data` 的 `image` / `image[]`、`mask`、`input_fidelity` 等字段。`stream:true` 时返回 `text/event-stream`，事件类型包含 `image_generation.partial_image`、`image_generation.completed`、`image_edit.partial_image`、`image_edit.completed`，否则返回 OpenAI 风格 JSON。
+- **Images**：`/v1/images/generations` 与 `/v1/images/edits` 默认使用 `gpt-image-2` 图像工具；`edits` 的 JSON 输入需要 `image` 或 `images` 之一，`multipart/form-data` 需要 `image` 或重复 `image[]`，并支持 `mask`、`input_fidelity` 等字段。`stream:true` 时返回 `text/event-stream`，SSE `event:` 类型包含 `image_generation.partial_image`、`image_generation.completed`、`image_edit.partial_image`、`image_edit.completed`；图片流以 completed/error 事件或连接关闭作为结束条件。
 - **Responses WebSocket**：`GET /v1/responses`、`GET /responses` 与 `GET /backend-api/codex/responses` 提供 Codex CLI 兼容 WebSocket；客户端发送 `response.create` 或普通 Responses JSON 消息，服务端转发上游 SSE payload 为 WebSocket text frame。
 - **Version 请求头**：默认不合成 `Version`；只有客户端显式传入 `Version: <CODEX_CLI_VERSION>` 时才透传给 Codex 上游。未传该头时保持为空。
 - **Responses builtin tools 标准化**：Responses 与 Chat Completions 会标准化内置工具类型，例如将 `web_search_preview` / `web_search_preview_2025_03_11` 归一为 `web_search`；Chat Completions 的 function tools 会转换为 Codex Responses 工具格式。

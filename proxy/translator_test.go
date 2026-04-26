@@ -68,6 +68,32 @@ func TestTranslateRequest_PreservesSupportedServiceTier(t *testing.T) {
 	}
 }
 
+func TestTranslateRequest_PreservesDeveloperRoleAndConvertsSystem(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[
+			{"role":"system","content":"system rules"},
+			{"role":"developer","content":"developer rules"},
+			{"role":"user","content":"hello"}
+		]
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	if role := gjson.GetBytes(got, "input.0.role").String(); role != "developer" {
+		t.Fatalf("system role translated to %q, want developer; body=%s", role, string(got))
+	}
+	if role := gjson.GetBytes(got, "input.1.role").String(); role != "developer" {
+		t.Fatalf("developer role translated to %q, want developer; body=%s", role, string(got))
+	}
+	if role := gjson.GetBytes(got, "input.2.role").String(); role != "user" {
+		t.Fatalf("user role translated to %q, want user; body=%s", role, string(got))
+	}
+}
+
 func TestNormalizeCodexBuiltinTools(t *testing.T) {
 	raw := []byte(`{
 		"tools":[
@@ -112,6 +138,29 @@ func TestEnsureImageGenerationTool(t *testing.T) {
 	}
 	if fmt := gjson.GetBytes(got, "tools.1.output_format").String(); fmt != "png" {
 		t.Fatalf("tools.1.output_format = %q, want png", fmt)
+	}
+}
+
+func TestEnsureImageGenerationToolSkipsFreePlan(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.4","tools":[{"type":"web_search"}]}`)
+
+	got := ensureImageGenerationTool(raw, "gpt-5.4", "free")
+
+	if gjson.GetBytes(got, "tools.1").Exists() {
+		t.Fatalf("free plan should not get image_generation tool: %s", string(got))
+	}
+}
+
+func TestEnsureImageGenerationToolDoesNotDuplicateExisting(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.4","tools":[{"type":"image_generation","output_format":"png"}]}`)
+
+	got := ensureImageGenerationTool(raw, "gpt-5.4", "plus")
+
+	if count := len(gjson.GetBytes(got, "tools").Array()); count != 1 {
+		t.Fatalf("image_generation tool should not be duplicated, got %d tools: %s", count, string(got))
+	}
+	if typ := gjson.GetBytes(got, "tools.0.type").String(); typ != "image_generation" {
+		t.Fatalf("tools.0.type = %q, want image_generation; body=%s", typ, string(got))
 	}
 }
 

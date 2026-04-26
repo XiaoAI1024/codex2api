@@ -67,7 +67,7 @@ func TestApplyCodexRequestHeadersDoesNotSynthesizeVersionByDefault(t *testing.T)
 	}
 }
 
-func TestApplyCodexRequestHeaders_ForwardsExplicitVersionHeaderForNonGPT55(t *testing.T) {
+func TestApplyCodexRequestHeaders_ForwardsExplicitVersionHeader(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
@@ -87,7 +87,7 @@ func TestApplyCodexRequestHeaders_ForwardsExplicitVersionHeaderForNonGPT55(t *te
 	}
 }
 
-func TestApplyCodexRequestHeaders_SuppressesVersionForGPT55ByDefault(t *testing.T) {
+func TestApplyCodexRequestHeaders_DoesNotSynthesizeVersionForGPT55ByDefault(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com", nil)
 	if err != nil {
 		t.Fatalf("new request: %v", err)

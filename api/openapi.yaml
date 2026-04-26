@@ -288,7 +288,8 @@ components:
                     type: array
               finish_reason:
                 type: string
-                enum: [stop, length, tool_calls, content_filter, null]
+                nullable: true
+                enum: [stop, length, tool_calls, content_filter]
               logprobs:
                 type: object
         usage:
@@ -345,7 +346,8 @@ components:
                     type: array
               finish_reason:
                 type: string
-                enum: [stop, length, tool_calls, content_filter, null]
+                nullable: true
+                enum: [stop, length, tool_calls, content_filter]
 
     ResponsesRequest:
       type: object
@@ -510,6 +512,11 @@ components:
       type: object
       required:
         - prompt
+      anyOf:
+        - required:
+            - image
+        - required:
+            - images
       properties:
         prompt:
           type: string
@@ -520,7 +527,7 @@ components:
           default: gpt-image-2
           example: gpt-image-2
         image:
-          description: Base image input (single URL, data URL, raw base64 string, object, or array form)
+          description: Base image input for JSON mode. One of image or images is required.
           oneOf:
             - type: string
             - type: array
@@ -533,7 +540,7 @@ components:
                         type: string
         images:
           type: array
-          description: Additional image inputs (JSON mode)
+          description: Image inputs for JSON mode. One of image or images is required.
           items:
             oneOf:
               - type: string
@@ -596,6 +603,11 @@ components:
       type: object
       required:
         - prompt
+      anyOf:
+        - required:
+            - image
+        - required:
+            - 'image[]'
       properties:
         prompt:
           type: string
@@ -606,10 +618,10 @@ components:
         image:
           type: string
           format: binary
-          description: Input image file. Clients may also send repeated image[] parts.
-        image[]:
+          description: Input image file. One of image or repeated image[] parts is required.
+        'image[]':
           type: array
-          description: Repeated input image files
+          description: Repeated input image files. One of image or image[] is required.
           items:
             type: string
             format: binary
@@ -668,6 +680,22 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ImageData'
+        usage:
+          type: object
+          description: Usage metadata returned by the image tool, when present
+          additionalProperties: true
+        output_format:
+          type: string
+          description: Output image format returned by the image tool
+        quality:
+          type: string
+          description: Output image quality returned by the image tool
+        size:
+          type: string
+          description: Output image size returned by the image tool
+        background:
+          type: string
+          description: Output background mode returned by the image tool
 
     ImageStreamEvent:
       type: object
@@ -981,9 +1009,64 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ResponsesResponse'
-            text/event-stream:
+        '400':
+          description: Invalid request
+          content:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /backend-api/codex/responses/compact:
+    servers:
+      - url: http://example.com
+        description: Root-path placeholder base URL for Codex CLI direct compatibility
+    post:
+      summary: Create compact response through Codex direct route
+      description: |
+        Direct Codex CLI compatibility alias for POST /v1/responses/compact.
+        Requests with `stream:true` are rejected with `400`.
+      operationId: createBackendCodexResponseCompact
+      tags:
+        - Responses
+      parameters:
+        - $ref: '#/components/parameters/CodexVersionHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResponsesRequest'
+      responses:
+        '200':
+          description: Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResponsesResponse'
         '400':
           description: Invalid request
           content:
@@ -1022,7 +1105,8 @@ paths:
         OpenAI-compatible images generation endpoint.
         Default model is `gpt-image-2`.
         When stream is true, returns SSE events such as
-        image_generation.partial_image and image_generation.completed.
+        `event: image_generation.partial_image` and
+        `event: image_generation.completed`.
       operationId: createImageGeneration
       tags:
         - Images
@@ -1082,7 +1166,8 @@ paths:
         OpenAI-compatible images edit endpoint.
         Supports JSON requests and multipart/form-data with image, image[],
         mask, and input_fidelity fields. When stream is true, returns SSE
-        events such as image_edit.partial_image and image_edit.completed.
+        events such as `event: image_edit.partial_image` and
+        `event: image_edit.completed`.
       operationId: createImageEdit
       tags:
         - Images
@@ -1148,6 +1233,7 @@ paths:
       operationId: healthCheck
       tags:
         - Health
+      security: []
       responses:
         '200':
           description: Service is healthy

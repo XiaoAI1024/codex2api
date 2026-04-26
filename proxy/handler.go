@@ -985,8 +985,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 		downstreamHeaders := c.Request.Header.Clone()
 		sessionID := ResolveSessionID(c.GetHeader("Authorization"), rawBody)
-		attemptBody := ensureImageGenerationTool(codexBody, model, account.GetPlanType())
-		resp, attemptTrace, reqErr := ExecuteRequestTracedToPath(c.Request.Context(), account, attemptBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, "/responses/compact", false)
+		resp, attemptTrace, reqErr := ExecuteRequestTracedToPath(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, "/responses/compact", false)
 		durationMs := int(time.Since(start).Milliseconds())
 		upstreamStageMs += int64(durationMs)
 		c.Set("x-upstream-stage-ms", upstreamStageMs)
