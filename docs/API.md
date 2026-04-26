@@ -150,7 +150,7 @@ data: [DONE]
 
 **Compact 端点:** `POST /v1/responses/compact`、`POST /responses/compact`、`POST /backend-api/codex/responses/compact`
 
-`compact` 路径会请求 Codex 上游真实 `/responses/compact`，返回非流式 compact 响应；如果请求体包含 `stream:true`，会返回 `400 invalid_request_error`。
+`compact` 路径会请求 Codex 上游真实 `/responses/compact`，返回非流式 compact 响应；如果请求体包含 `stream:true`，会返回 `400 invalid_request_error`。为兼容 Codex compact 上游，`store`、`parallel_tool_calls`、`include` 会在转发前移除。
 
 **请求示例:**
 ```json

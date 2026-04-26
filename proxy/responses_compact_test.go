@@ -33,7 +33,7 @@ func TestResponsesCompactRejectsStream(t *testing.T) {
 }
 
 func TestPrepareCompactRequestBodyNormalizesForUpstream(t *testing.T) {
-	body, reasoningEffort := prepareCompactRequestBody([]byte(`{"model":"gpt-5.4","input":"hello","stream":false,"store":true,"parallel_tool_calls":false,"instructions":null,"reasoning_effort":"high","context_management":[{"type":"compaction"}],"truncation":"disabled","user":"u1"}`), "gpt-5.4")
+	body, reasoningEffort := prepareCompactRequestBody([]byte(`{"model":"gpt-5.4","input":"hello","stream":false,"store":true,"parallel_tool_calls":false,"include":["reasoning.encrypted_content"],"instructions":null,"reasoning_effort":"high","context_management":[{"type":"compaction"}],"truncation":"disabled","user":"u1"}`), "gpt-5.4")
 
 	if gjson.GetBytes(body, "stream").Exists() {
 		t.Fatalf("stream should be removed from compact upstream body: %s", string(body))
@@ -44,8 +44,8 @@ func TestPrepareCompactRequestBodyNormalizesForUpstream(t *testing.T) {
 	if gjson.GetBytes(body, "parallel_tool_calls").Exists() {
 		t.Fatalf("parallel_tool_calls should be removed from compact upstream body: %s", string(body))
 	}
-	if got := gjson.GetBytes(body, "include.0").String(); got != "reasoning.encrypted_content" {
-		t.Fatalf("include.0 = %q, want reasoning.encrypted_content; body=%s", got, string(body))
+	if gjson.GetBytes(body, "include").Exists() {
+		t.Fatalf("include should be removed from compact upstream body: %s", string(body))
 	}
 	if got := gjson.GetBytes(body, "instructions").String(); got != "" {
 		t.Fatalf("instructions = %q, want empty string", got)
@@ -118,7 +118,7 @@ func TestResponsesCompactDoesNotAddImageGenerationTool(t *testing.T) {
 	h.configKeys = map[string]bool{"sk-test": true}
 	h.RegisterRoutes(r)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"gpt-5.4","input":"hello","store":true,"parallel_tool_calls":false,"tools":[{"type":"web_search"}]}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"gpt-5.4","input":"hello","store":true,"parallel_tool_calls":false,"include":["reasoning.encrypted_content"],"tools":[{"type":"web_search"}]}`))
 	req.Header.Set("Authorization", "Bearer sk-test")
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -141,6 +141,9 @@ func TestResponsesCompactDoesNotAddImageGenerationTool(t *testing.T) {
 	}
 	if gjson.GetBytes(gotBody, "parallel_tool_calls").Exists() {
 		t.Fatalf("compact body should not forward parallel_tool_calls: %s", string(gotBody))
+	}
+	if gjson.GetBytes(gotBody, "include").Exists() {
+		t.Fatalf("compact body should not forward include: %s", string(gotBody))
 	}
 	if got := gjson.GetBytes(gotBody, "tools.0.type").String(); got != "web_search" {
 		t.Fatalf("tools.0.type = %q, want web_search; body=%s", got, string(gotBody))

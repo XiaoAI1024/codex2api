@@ -88,6 +88,8 @@ Rate limits are returned in response headers:
 | `/backend-api/codex/responses` | POST | Codex CLI direct compatibility alias for `/v1/responses` |
 | `/backend-api/codex/responses` | GET | Codex CLI direct WebSocket alias for `GET /v1/responses` |
 | `/backend-api/codex/responses/compact` | POST | Codex CLI direct compatibility alias for `/v1/responses/compact` |
+
+Compact requests are sanitized for the Codex upstream: `store`, `parallel_tool_calls`, and `include` are not forwarded to `/responses/compact`.
 | `/v1/images/generations` | POST | Generate images (root-path alias: `/images/generations`) |
 | `/v1/images/edits` | POST | Edit images with JSON or multipart form data (root-path alias: `/images/edits`) |
 | `/health` | GET | Health check; no Authorization header required |

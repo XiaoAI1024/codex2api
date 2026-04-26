@@ -997,6 +997,8 @@ paths:
         Handles context compaction requests by forwarding to the Codex upstream
         `/responses/compact` endpoint and returning the non-streaming compact
         response. Requests with `stream:true` are rejected with `400`.
+        For upstream compatibility, `store`, `parallel_tool_calls`, and
+        `include` are removed before forwarding to `/responses/compact`.
         Also available as `/backend-api/codex/responses/compact` for Codex CLI
         direct base URL compatibility.
       operationId: createResponseCompact
