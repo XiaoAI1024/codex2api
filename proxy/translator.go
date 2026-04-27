@@ -119,32 +119,7 @@ func normalizeCodexBuiltinToolType(toolType string) string {
 	}
 }
 
-var imageGenerationToolJSON = []byte(`{"type":"image_generation","output_format":"png"}`)
-var imageGenerationToolArrayJSON = []byte(`[{"type":"image_generation","output_format":"png"}]`)
-
-func accountUsesFreePlan(accountPlan string) bool {
-	return strings.EqualFold(strings.TrimSpace(accountPlan), "free")
-}
-
-func ensureImageGenerationTool(body []byte, model string, accountPlan ...string) []byte {
-	if strings.HasSuffix(strings.ToLower(strings.TrimSpace(model)), "spark") {
-		return body
-	}
-	if len(accountPlan) > 0 && accountUsesFreePlan(accountPlan[0]) {
-		return body
-	}
-
-	tools := gjson.GetBytes(body, "tools")
-	if !tools.Exists() || !tools.IsArray() {
-		body, _ = sjson.SetRawBytes(body, "tools", imageGenerationToolArrayJSON)
-		return body
-	}
-	for _, tool := range tools.Array() {
-		if tool.Get("type").String() == "image_generation" {
-			return body
-		}
-	}
-	body, _ = sjson.SetRawBytes(body, "tools.-1", imageGenerationToolJSON)
+func ensureImageGenerationTool(body []byte, _ string, _ ...string) []byte {
 	return body
 }
 

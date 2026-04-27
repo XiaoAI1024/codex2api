@@ -216,6 +216,7 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 ### CLIProxyAPI 兼容要点
 
 - **Images**：`/v1/images/generations` 与 `/v1/images/edits` 默认使用 `gpt-image-2` 图像工具；`edits` 的 JSON 输入需要 `image` 或 `images` 之一，`multipart/form-data` 需要 `image` 或重复 `image[]`，并支持 `mask`、`input_fidelity` 等字段。`stream:true` 时返回 `text/event-stream`，SSE `event:` 类型包含 `image_generation.partial_image`、`image_generation.completed`、`image_edit.partial_image`、`image_edit.completed`；图片流以 completed/error 事件或连接关闭作为结束条件。
+- **Responses 图片工具 explicit 模式**：`/v1/responses`、`/responses` 与 WebSocket 不会自动补 `image_generation` 工具；只有下游请求已显式携带该工具，或调用 `/v1/images/*` 图片端点时，才会走 `gpt-image-2`。
 - **Responses WebSocket**：`GET /v1/responses`、`GET /responses` 与 `GET /backend-api/codex/responses` 提供 Codex CLI 兼容 WebSocket；客户端发送 `response.create` 或普通 Responses JSON 消息，服务端转发上游 SSE payload 为 WebSocket text frame。
 - **Version 请求头**：默认不合成 `Version`；只有客户端显式传入 `Version: <CODEX_CLI_VERSION>` 时才透传给 Codex 上游。未传该头时保持为空。
 - **Responses builtin tools 标准化**：Responses 与 Chat Completions 会标准化内置工具类型，例如将 `web_search_preview` / `web_search_preview_2025_03_11` 归一为 `web_search`；Chat Completions 的 function tools 会转换为 Codex Responses 工具格式。

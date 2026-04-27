@@ -128,16 +128,13 @@ func TestNormalizeCodexBuiltinTools(t *testing.T) {
 	}
 }
 
-func TestEnsureImageGenerationTool(t *testing.T) {
+func TestEnsureImageGenerationToolDoesNotAutoAddWhenMissing(t *testing.T) {
 	raw := []byte(`{"model":"gpt-5.4","tools":[{"type":"web_search"}]}`)
 
 	got := ensureImageGenerationTool(raw, "gpt-5.4")
 
-	if typ := gjson.GetBytes(got, "tools.1.type").String(); typ != "image_generation" {
-		t.Fatalf("tools.1.type = %q, want image_generation; body=%s", typ, string(got))
-	}
-	if fmt := gjson.GetBytes(got, "tools.1.output_format").String(); fmt != "png" {
-		t.Fatalf("tools.1.output_format = %q, want png", fmt)
+	if gjson.GetBytes(got, "tools.1").Exists() {
+		t.Fatalf("image_generation should not be auto-added in explicit mode: %s", string(got))
 	}
 }
 

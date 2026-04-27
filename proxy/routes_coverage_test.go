@@ -78,7 +78,7 @@ func TestChatCompletionsRouteForwardsDeveloperRole(t *testing.T) {
 	}
 }
 
-func TestRootResponsesRouteAddsImageGenerationTool(t *testing.T) {
+func TestRootResponsesRouteDoesNotAutoAddImageGenerationTool(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	var gotPath string
@@ -106,7 +106,7 @@ func TestRootResponsesRouteAddsImageGenerationTool(t *testing.T) {
 	if gotPath != "/responses" {
 		t.Fatalf("upstream path = %q, want /responses", gotPath)
 	}
-	if got := gjson.GetBytes(gotBody, "tools.1.type").String(); got != "image_generation" {
-		t.Fatalf("tools.1.type = %q, want image_generation; body=%s", got, string(gotBody))
+	if gjson.GetBytes(gotBody, "tools.1").Exists() {
+		t.Fatalf("image_generation should not be auto-added in explicit mode: %s", string(gotBody))
 	}
 }

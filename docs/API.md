@@ -187,6 +187,8 @@ data: [DONE]
 
 Codex2API 在转发 Responses / Chat Completions 前会对内置工具类型做兼容归一：
 
+`image_generation` 采用 explicit 模式：普通 Responses / WebSocket 请求不会自动补该工具；只有下游请求显式携带 `image_generation`，或调用 `/v1/images/*` 图片端点时，才会触发 `gpt-image-2`。
+
 | 输入工具类型 | 上游工具类型 |
 | --- | --- |
 | `web_search_preview` | `web_search` |

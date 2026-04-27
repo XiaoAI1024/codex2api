@@ -409,7 +409,10 @@ components:
           description: |
             Responses tools. Built-in tool aliases are normalized before
             upstream forwarding; for example web_search_preview and
-            web_search_preview_2025_03_11 become web_search.
+            web_search_preview_2025_03_11 become web_search. The
+            image_generation tool is explicit-only: it is forwarded when
+            supplied by the downstream request, but is not auto-added by
+            Responses endpoints.
           items:
             type: object
             additionalProperties: true

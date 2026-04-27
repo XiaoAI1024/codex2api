@@ -161,6 +161,8 @@ data: {"type":"image_generation.completed","b64_json":"<BASE64_IMAGE>","usage":{
 
 `GET /v1/responses`, `GET /responses`, and `GET /backend-api/codex/responses` expose the Codex CLI compatible WebSocket transport. Clients send a JSON text frame using either a `response.create` envelope or a plain Responses API request:
 
+Responses endpoints use explicit image-tool behavior: Codex2API does not auto-add `image_generation`; forward it only when the downstream request already includes it. `/v1/images/*` endpoints still construct the image tool request internally.
+
 ```json
 {
   "type": "response.create",
