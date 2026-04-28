@@ -128,38 +128,36 @@ func TestPrepareResponsesBody_FillsMissingArrayItemsInToolSchema(t *testing.T) {
 	}
 }
 
-func TestPrepareResponsesBody_DefaultsIncludeForResponses(t *testing.T) {
-	raw := []byte(`{
-		"model":"gpt-5.4",
-		"input":"test"
-	}`)
+func TestPrepareResponsesBody_DoesNotInjectImageToolForTextModels(t *testing.T) {
+	for _, model := range []string{"gpt-5.3", "gpt-5.4", "gpt-5.5"} {
+		t.Run(model, func(t *testing.T) {
+			raw := []byte(fmt.Sprintf(`{
+				"model":%q,
+				"input":"test"
+			}`, model))
 
-	got, _ := PrepareResponsesBody(raw)
+			got, _ := PrepareResponsesBody(raw)
 
-	include := gjson.GetBytes(got, "include")
-	if !include.Exists() || len(include.Array()) != 1 || include.Array()[0].String() != "reasoning.encrypted_content" {
-		t.Fatalf("expected default include for responses, got %s", include.Raw)
-	}
-	if stream := gjson.GetBytes(got, "stream"); !stream.Exists() || !stream.Bool() {
-		t.Fatalf("expected stream to be forced for responses, got %s", stream.Raw)
-	}
-	if store := gjson.GetBytes(got, "store"); !store.Exists() || store.Bool() {
-		t.Fatalf("expected store=false for responses, got %s", store.Raw)
-	}
-	if gotTool := gjson.GetBytes(got, "tools.0.type").String(); gotTool != "image_generation" {
-		t.Fatalf("expected default image_generation tool, got %s", string(got))
-	}
-	if model := gjson.GetBytes(got, "tools.0.model").String(); model != defaultImagesToolModel {
-		t.Fatalf("expected default image model %q, got %q", defaultImagesToolModel, model)
-	}
-	if size := gjson.GetBytes(got, "tools.0.size").String(); size != defaultImages1KSize {
-		t.Fatalf("expected default image size %q, got %q", defaultImages1KSize, size)
-	}
-	if format := gjson.GetBytes(got, "tools.0.output_format").String(); format != "png" {
-		t.Fatalf("expected default image output_format png, got %q", format)
-	}
-	if instructions := gjson.GetBytes(got, "instructions").String(); !strings.Contains(instructions, codexImageGenerationBridgeMarker) {
-		t.Fatalf("expected bridge instructions, got %q", instructions)
+			include := gjson.GetBytes(got, "include")
+			if !include.Exists() || len(include.Array()) != 1 || include.Array()[0].String() != "reasoning.encrypted_content" {
+				t.Fatalf("expected default include for responses, got %s", include.Raw)
+			}
+			if stream := gjson.GetBytes(got, "stream"); !stream.Exists() || !stream.Bool() {
+				t.Fatalf("expected stream to be forced for responses, got %s", stream.Raw)
+			}
+			if store := gjson.GetBytes(got, "store"); !store.Exists() || store.Bool() {
+				t.Fatalf("expected store=false for responses, got %s", store.Raw)
+			}
+			if tools := gjson.GetBytes(got, "tools"); tools.Exists() {
+				t.Fatalf("ordinary text model should not get image_generation tools, got %s", got)
+			}
+			if choice := gjson.GetBytes(got, "tool_choice"); choice.Exists() {
+				t.Fatalf("ordinary text model should not get image tool_choice, got %s", got)
+			}
+			if instructions := gjson.GetBytes(got, "instructions").String(); strings.Contains(instructions, codexImageGenerationBridgeMarker) {
+				t.Fatalf("ordinary text model should not get image bridge instructions, got %q", instructions)
+			}
+		})
 	}
 }
 
@@ -315,9 +313,9 @@ func TestPrepareResponsesBody_InvalidImageSizeSurvivesForValidation(t *testing.T
 	}
 }
 
-func TestPrepareResponsesBody_PromptCompatAndTopLevelImageOptions(t *testing.T) {
+func TestPrepareResponsesBody_ImageOnlyPromptCompatAndTopLevelImageOptions(t *testing.T) {
 	raw := []byte(`{
-		"model":"gpt-5.4-mini",
+		"model":"gpt-image-2",
 		"prompt":"draw a skyline sticker",
 		"size":"1536x1024",
 		"quality":"high",
@@ -352,7 +350,7 @@ func TestPrepareResponsesBody_PromptCompatAndTopLevelImageOptions(t *testing.T) 
 	}
 }
 
-func TestPrepareResponsesBody_InjectsImageToolWithinToolLimit(t *testing.T) {
+func TestPrepareResponsesBody_DoesNotInjectImageToolWithinToolLimit(t *testing.T) {
 	tools := make([]any, maxTools)
 	for i := range tools {
 		tools[i] = map[string]any{
@@ -380,12 +378,16 @@ func TestPrepareResponsesBody_InjectsImageToolWithinToolLimit(t *testing.T) {
 	if len(outTools) != maxTools {
 		t.Fatalf("tools count = %d, want %d; body=%s", len(outTools), maxTools, got)
 	}
-	last := outTools[len(outTools)-1]
-	if last.Get("type").String() != "image_generation" {
-		t.Fatalf("last tool type = %q, want image_generation; body=%s", last.Get("type").String(), got)
+	for i, tool := range outTools {
+		if tool.Get("type").String() == "image_generation" {
+			t.Fatalf("ordinary text model should not get image_generation tool at index %d; body=%s", i, got)
+		}
 	}
-	if last.Get("model").String() != defaultImagesToolModel {
-		t.Fatalf("image tool model = %q, want %q; body=%s", last.Get("model").String(), defaultImagesToolModel, got)
+	if choice := gjson.GetBytes(got, "tool_choice"); choice.Exists() {
+		t.Fatalf("ordinary text model should not get image tool_choice, got %s", got)
+	}
+	if instructions := gjson.GetBytes(got, "instructions").String(); strings.Contains(instructions, codexImageGenerationBridgeMarker) {
+		t.Fatalf("ordinary text model should not get image bridge instructions, got %q", instructions)
 	}
 }
 
@@ -437,12 +439,13 @@ func TestPrepareResponsesBody_PreservesExistingImageToolAndNormalizesAliases(t *
 func TestPrepareCompactResponsesBody_RemovesUnsupportedInjectedFields(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
-		"input":"test"
+		"input":"test",
+		"parallel_tool_calls":true
 	}`)
 
 	got, _ := PrepareCompactResponsesBody(raw)
 
-	for _, field := range []string{"include", "store", "stream"} {
+	for _, field := range []string{"include", "store", "stream", "parallel_tool_calls"} {
 		if gjson.GetBytes(got, field).Exists() {
 			t.Fatalf("expected %s to be removed for compact body", field)
 		}

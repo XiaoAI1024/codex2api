@@ -288,13 +288,6 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	return resp, nil
 }
 
-func codexVersionFromProfile(profile deviceProfile, fallback string) string {
-	if profile.HasVersion {
-		return fmt.Sprintf("%d.%d.%d", profile.Version.major, profile.Version.minor, profile.Version.patch)
-	}
-	return strings.TrimSpace(fallback)
-}
-
 func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessToken, cacheKey, apiKey string, deviceCfg *DeviceProfileConfig, downstreamHeaders http.Header) {
 	if req == nil {
 		return
@@ -307,25 +300,18 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 		account.Mu().RUnlock()
 	}
 
-	var profile deviceProfile
-	version := ""
 	if IsDeviceProfileStabilizationEnabled(deviceCfg) {
-		profile = ResolveDeviceProfile(account, apiKey, downstreamHeaders, deviceCfg)
+		profile := ResolveDeviceProfile(account, apiKey, downstreamHeaders, deviceCfg)
 		ApplyDeviceProfileHeaders(req, profile)
-		version = codexVersionFromProfile(profile, strings.TrimSpace(deviceCfg.PackageVersion))
 	} else {
 		clientProfile := ProfileForAccount(account.ID())
 		req.Header.Set("User-Agent", clientProfile.UserAgent)
-		version = clientProfile.Version
 	}
 
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Connection", "Keep-Alive")
-	if version != "" {
-		req.Header.Set("Version", version)
-	}
 	if originator := strings.TrimSpace(downstreamHeaders.Get("Originator")); originator != "" {
 		req.Header.Set("Originator", originator)
 	} else {

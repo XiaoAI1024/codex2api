@@ -164,6 +164,7 @@ func TestApplyCodexRequestHeadersUsesSessionIDWithoutConversationID(t *testing.T
 	}
 	downstreamHeaders := http.Header{
 		"Originator": []string{"custom-originator"},
+		"Version":    []string{"9.9.9"},
 	}
 
 	applyCodexRequestHeaders(req, acc, "token-123", "cache-key-1", "api-key-1", cfg, downstreamHeaders)
@@ -180,8 +181,20 @@ func TestApplyCodexRequestHeadersUsesSessionIDWithoutConversationID(t *testing.T
 	if got := req.Header.Get("User-Agent"); got != cfg.UserAgent {
 		t.Fatalf("User-Agent = %q", got)
 	}
-	if got := req.Header.Get("Version"); got != "0.120.0" {
-		t.Fatalf("Version = %q", got)
+	if got := req.Header.Get("X-Stainless-Package-Version"); got != cfg.PackageVersion {
+		t.Fatalf("X-Stainless-Package-Version = %q", got)
+	}
+	if got := req.Header.Get("X-Stainless-Runtime-Version"); got != cfg.RuntimeVersion {
+		t.Fatalf("X-Stainless-Runtime-Version = %q", got)
+	}
+	if got := req.Header.Get("X-Stainless-Os"); got != cfg.OS {
+		t.Fatalf("X-Stainless-Os = %q", got)
+	}
+	if got := req.Header.Get("X-Stainless-Arch"); got != cfg.Arch {
+		t.Fatalf("X-Stainless-Arch = %q", got)
+	}
+	if got := req.Header.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty", got)
 	}
 	if got := req.Header.Get("Originator"); got != "custom-originator" {
 		t.Fatalf("Originator = %q", got)
@@ -202,13 +215,17 @@ func TestApplyCodexRequestHeadersUsesLatestProfileByDefault(t *testing.T) {
 		AccountID: "acct-42",
 	}
 
-	applyCodexRequestHeaders(req, acc, "token-123", "", "api-key-1", nil, http.Header{})
+	downstreamHeaders := http.Header{
+		"Version": []string{"9.9.9"},
+	}
+
+	applyCodexRequestHeaders(req, acc, "token-123", "", "api-key-1", nil, downstreamHeaders)
 
 	if got := req.Header.Get("User-Agent"); !strings.Contains(got, latestCodexCLIUserAgentPrefix) {
 		t.Fatalf("User-Agent = %q, want latest Codex CLI %s", got, latestCodexCLIVersion)
 	}
-	if got := req.Header.Get("Version"); got != latestCodexCLIVersion {
-		t.Fatalf("Version = %q, want %q", got, latestCodexCLIVersion)
+	if got := req.Header.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty", got)
 	}
 }
 

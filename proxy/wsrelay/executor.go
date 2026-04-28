@@ -185,7 +185,7 @@ func (e *Executor) prepareWebsocketHeaders(accessToken, accountID, sessionID, ap
 	// Beta header 启用 WebSocket 响应 API
 	headers.Set("OpenAI-Beta", responsesWebsocketBetaHeader)
 
-	// User-Agent 和版本
+	// User-Agent 和 Stainless 设备画像；Version 默认不主动合成或透传。
 	account := &auth.Account{}
 	if accountID != "" {
 		account.AccountID = accountID
@@ -196,13 +196,13 @@ func (e *Executor) prepareWebsocketHeaders(accessToken, accountID, sessionID, ap
 	if proxy.IsDeviceProfileStabilizationEnabled(deviceCfg) {
 		profile := proxy.ResolveDeviceProfile(account, apiKey, ginHeaders, deviceCfg)
 		headers.Set("User-Agent", profile.UserAgent)
-		if version := strings.TrimSpace(profile.PackageVersion); version != "" {
-			headers.Set("Version", version)
-		}
+		headers.Set("X-Stainless-Package-Version", profile.PackageVersion)
+		headers.Set("X-Stainless-Runtime-Version", profile.RuntimeVersion)
+		headers.Set("X-Stainless-Os", profile.OS)
+		headers.Set("X-Stainless-Arch", profile.Arch)
 	} else {
 		profile := proxy.ProfileForAccount(account.ID())
 		headers.Set("User-Agent", profile.UserAgent)
-		headers.Set("Version", profile.Version)
 	}
 	if betaFeatures := strings.TrimSpace(ginHeaders.Get("X-Codex-Beta-Features")); betaFeatures != "" {
 		headers.Set("X-Codex-Beta-Features", betaFeatures)

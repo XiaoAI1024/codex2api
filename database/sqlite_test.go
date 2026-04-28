@@ -85,7 +85,7 @@ func TestUsageLogsPersistImageMetadata(t *testing.T) {
 	}
 }
 
-func TestSoftDeleteAccountMarksDeletedStatus(t *testing.T) {
+func TestSoftDeleteAccountPhysicallyDeletesAccountAndRelatedRows(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
 	db, err := New("sqlite", dbPath)
@@ -99,36 +99,44 @@ func TestSoftDeleteAccountMarksDeletedStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertAccount 返回错误: %v", err)
 	}
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		AccountID:  id,
+		Endpoint:   "/v1/responses",
+		Model:      "gpt-5.4",
+		StatusCode: 200,
+	}); err != nil {
+		t.Fatalf("InsertUsageLog 返回错误: %v", err)
+	}
+	db.flushLogs()
+	if err := db.InsertAccountEvent(ctx, id, "deleted", "manual"); err != nil {
+		t.Fatalf("InsertAccountEvent 返回错误: %v", err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `CREATE TABLE public_account_settlements (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL)`); err != nil {
+		t.Fatalf("创建 public_account_settlements 返回错误: %v", err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `INSERT INTO public_account_settlements (account_id) VALUES ($1)`, id); err != nil {
+		t.Fatalf("插入 public_account_settlements 返回错误: %v", err)
+	}
+
 	if err := db.SoftDeleteAccount(ctx, id); err != nil {
 		t.Fatalf("SoftDeleteAccount 返回错误: %v", err)
 	}
 
-	active, err := db.ListActive(ctx)
-	if err != nil {
-		t.Fatalf("ListActive 返回错误: %v", err)
-	}
-	if len(active) != 0 {
-		t.Fatalf("ListActive 返回 %d 条，want 0", len(active))
-	}
-	if _, err := db.GetAccountByID(ctx, id); err == nil {
-		t.Fatal("GetAccountByID 应该排除已删除账号")
-	}
+	assertSQLiteCount(t, db, `SELECT COUNT(*) FROM accounts WHERE id = $1`, []interface{}{id}, 0)
+	assertSQLiteCount(t, db, `SELECT COUNT(*) FROM usage_logs WHERE account_id = $1`, []interface{}{id}, 0)
+	assertSQLiteCount(t, db, `SELECT COUNT(*) FROM account_events WHERE account_id = $1`, []interface{}{id}, 1)
+	assertSQLiteCount(t, db, `SELECT COUNT(*) FROM public_account_settlements WHERE account_id = $1`, []interface{}{id}, 0)
 
-	var status string
-	var errorMessage string
-	var deletedAt sql.NullString
-	if err := db.conn.QueryRowContext(ctx, `SELECT status, error_message, deleted_at FROM accounts WHERE id = $1`, id).Scan(&status, &errorMessage, &deletedAt); err != nil {
-		t.Fatalf("查询账号状态返回错误: %v", err)
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		AccountID:  id,
+		Endpoint:   "/v1/responses",
+		Model:      "gpt-5.4",
+		StatusCode: 200,
+	}); err != nil {
+		t.Fatalf("deleted account InsertUsageLog 返回错误: %v", err)
 	}
-	if status != "deleted" {
-		t.Fatalf("status = %q, want deleted", status)
-	}
-	if errorMessage != "" {
-		t.Fatalf("error_message = %q, want empty", errorMessage)
-	}
-	if !deletedAt.Valid || deletedAt.String == "" {
-		t.Fatal("deleted_at 未写入")
-	}
+	db.flushLogs()
+	assertSQLiteCount(t, db, `SELECT COUNT(*) FROM usage_logs WHERE account_id = $1`, []interface{}{id}, 0)
 }
 
 func TestSQLiteMigratesLegacyDeletedAccounts(t *testing.T) {
@@ -143,8 +151,12 @@ func TestSQLiteMigratesLegacyDeletedAccounts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertAccount 返回错误: %v", err)
 	}
-	if err := db.SetError(ctx, id, "deleted"); err != nil {
-		t.Fatalf("SetError 返回错误: %v", err)
+	if _, err := db.conn.ExecContext(ctx, `
+		UPDATE accounts
+		SET status = 'error', error_message = 'deleted', updated_at = CURRENT_TIMESTAMP
+		WHERE id = $1
+	`, id); err != nil {
+		t.Fatalf("写入 legacy deleted 账号返回错误: %v", err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close 返回错误: %v", err)
@@ -171,6 +183,84 @@ func TestSQLiteMigratesLegacyDeletedAccounts(t *testing.T) {
 	if !deletedAt.Valid || deletedAt.String == "" {
 		t.Fatal("deleted_at 未迁移")
 	}
+}
+
+func TestSetErrorDeletedPhysicallyDeletesAccount(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	id, err := db.InsertAccount(ctx, "seterror-delete", "rt-seterror-delete", "")
+	if err != nil {
+		t.Fatalf("InsertAccount 返回错误: %v", err)
+	}
+	if err := db.SetError(ctx, id, "deleted"); err != nil {
+		t.Fatalf("SetError 返回错误: %v", err)
+	}
+
+	assertSQLiteCount(t, db, `SELECT COUNT(*) FROM accounts WHERE id = $1`, []interface{}{id}, 0)
+}
+
+func TestBatchSoftDeleteAccountsPhysicallyDeletesAccounts(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	firstID, err := db.InsertAccount(ctx, "batch-delete-1", "rt-batch-delete-1", "")
+	if err != nil {
+		t.Fatalf("InsertAccount first 返回错误: %v", err)
+	}
+	secondID, err := db.InsertAccount(ctx, "batch-delete-2", "rt-batch-delete-2", "")
+	if err != nil {
+		t.Fatalf("InsertAccount second 返回错误: %v", err)
+	}
+	keepID, err := db.InsertAccount(ctx, "batch-keep", "rt-batch-keep", "")
+	if err != nil {
+		t.Fatalf("InsertAccount keep 返回错误: %v", err)
+	}
+
+	if err := db.BatchSoftDeleteAccounts(ctx, []int64{firstID, secondID}); err != nil {
+		t.Fatalf("BatchSoftDeleteAccounts 返回错误: %v", err)
+	}
+
+	assertSQLiteCount(t, db, `SELECT COUNT(*) FROM accounts WHERE id IN ($1, $2)`, []interface{}{firstID, secondID}, 0)
+	assertSQLiteCount(t, db, `SELECT COUNT(*) FROM accounts WHERE id = $1`, []interface{}{keepID}, 1)
+}
+
+func TestBatchSetErrorDeletedPhysicallyDeletesAccounts(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	firstID, err := db.InsertAccount(ctx, "batch-seterror-delete-1", "rt-batch-seterror-delete-1", "")
+	if err != nil {
+		t.Fatalf("InsertAccount first 返回错误: %v", err)
+	}
+	secondID, err := db.InsertAccount(ctx, "batch-seterror-delete-2", "rt-batch-seterror-delete-2", "")
+	if err != nil {
+		t.Fatalf("InsertAccount second 返回错误: %v", err)
+	}
+
+	if err := db.BatchSetError(ctx, []int64{firstID, secondID}, "deleted"); err != nil {
+		t.Fatalf("BatchSetError 返回错误: %v", err)
+	}
+
+	assertSQLiteCount(t, db, `SELECT COUNT(*) FROM accounts WHERE id IN ($1, $2)`, []interface{}{firstID, secondID}, 0)
 }
 
 func TestListActiveIncludesErrorAccounts(t *testing.T) {
@@ -354,5 +444,17 @@ func TestSQLiteUsageLogsTimeRangeUsesUTCStorage(t *testing.T) {
 	}
 	if got := page.Logs[0].Model; got != "gpt-image-2" {
 		t.Fatalf("Model = %q, want gpt-image-2", got)
+	}
+}
+
+func assertSQLiteCount(t *testing.T, db *DB, query string, args []interface{}, want int) {
+	t.Helper()
+
+	var got int
+	if err := db.conn.QueryRowContext(context.Background(), query, args...).Scan(&got); err != nil {
+		t.Fatalf("查询数量返回错误: %v", err)
+	}
+	if got != want {
+		t.Fatalf("%s count = %d, want %d", query, got, want)
 	}
 }

@@ -76,10 +76,14 @@ type DB struct {
 	// 使用日志批量写入缓冲
 	logBuf  []usageLogEntry
 	logMu   sync.Mutex
+	flushMu sync.Mutex
 	logStop chan struct{}
 	logWg   sync.WaitGroup
 	// 预分配日志缓冲以减少内存分配
 	logBufCap int
+
+	deletedAccountsMu sync.RWMutex
+	deletedAccountIDs map[int64]struct{}
 }
 
 // usageLogEntry 日志缓冲条目
@@ -146,10 +150,11 @@ func New(driver string, dsn string) (*DB, error) {
 	}
 
 	db := &DB{
-		conn:      conn,
-		driver:    driver,
-		logStop:   make(chan struct{}),
-		logBufCap: 128,
+		conn:              conn,
+		driver:            driver,
+		logStop:           make(chan struct{}),
+		logBufCap:         128,
+		deletedAccountIDs: make(map[int64]struct{}),
 	}
 	if db.isSQLite() {
 		if err := db.configureSQLite(ctx); err != nil {
@@ -820,7 +825,18 @@ type UsageLog struct {
 
 // InsertUsageLog 将日志追加到内存缓冲（非阻塞）
 func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
+	if log == nil {
+		return nil
+	}
+	if db.isHardDeletedAccountID(log.AccountID) {
+		return nil
+	}
+
 	db.logMu.Lock()
+	if db.isHardDeletedAccountID(log.AccountID) {
+		db.logMu.Unlock()
+		return nil
+	}
 	db.logBuf = append(db.logBuf, usageLogEntry{
 		AccountID:        log.AccountID,
 		Endpoint:         log.Endpoint,
@@ -911,6 +927,9 @@ func (db *DB) startLogFlusher() {
 
 // flushLogs 将缓冲中的日志批量写入 PG
 func (db *DB) flushLogs() {
+	db.flushMu.Lock()
+	defer db.flushMu.Unlock()
+
 	db.logMu.Lock()
 	if len(db.logBuf) == 0 {
 		db.logMu.Unlock()
@@ -919,6 +938,11 @@ func (db *DB) flushLogs() {
 	batch := db.logBuf
 	db.logBuf = make([]usageLogEntry, 0, db.logBufCap)
 	db.logMu.Unlock()
+
+	batch = db.filterHardDeletedUsageLogBatch(batch)
+	if len(batch) == 0 {
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // 增加超时时间
 	defer cancel()
@@ -1857,6 +1881,10 @@ func (db *DB) UpdateUsageSnapshotFull(ctx context.Context, id int64, pct7d float
 
 // SetError 标记账号错误状态
 func (db *DB) SetError(ctx context.Context, id int64, errorMsg string) error {
+	if errorMsg == "deleted" {
+		return db.deleteAccountsHard(ctx, []int64{id})
+	}
+
 	query := `UPDATE accounts SET status = 'error', error_message = $1, cooldown_reason = '', cooldown_until = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
 	_, err := db.conn.ExecContext(ctx, query, errorMsg, id)
 	return err
@@ -1864,6 +1892,10 @@ func (db *DB) SetError(ctx context.Context, id int64, errorMsg string) error {
 
 // BatchSetError 批量标记账号错误状态，分批执行避免 SQL 参数过多
 func (db *DB) BatchSetError(ctx context.Context, ids []int64, errorMsg string) error {
+	if errorMsg == "deleted" {
+		return db.deleteAccountsHard(ctx, ids)
+	}
+
 	const batchSize = 500
 	for i := 0; i < len(ids); i += batchSize {
 		end := i + batchSize
@@ -1892,24 +1924,117 @@ func (db *DB) BatchSetError(ctx context.Context, ids []int64, errorMsg string) e
 	return nil
 }
 
-// SoftDeleteAccount 将账号标记为 deleted，保留数据用于审计和事件追溯。
+// SoftDeleteAccount 保留历史函数名，但实际执行物理删除。
 func (db *DB) SoftDeleteAccount(ctx context.Context, id int64) error {
-	query := `
-		UPDATE accounts
-		SET status = 'deleted',
-			error_message = '',
-			cooldown_reason = '',
-			cooldown_until = NULL,
-			deleted_at = CURRENT_TIMESTAMP,
-			updated_at = CURRENT_TIMESTAMP
-		WHERE id = $1 AND status <> 'deleted'
-	`
-	_, err := db.conn.ExecContext(ctx, query, id)
-	return err
+	return db.deleteAccountsHard(ctx, []int64{id})
 }
 
-// BatchSoftDeleteAccounts 批量软删除账号，分批执行避免 SQL 参数过多。
+// BatchSoftDeleteAccounts 保留历史函数名，但实际批量执行物理删除。
 func (db *DB) BatchSoftDeleteAccounts(ctx context.Context, ids []int64) error {
+	return db.deleteAccountsHard(ctx, ids)
+}
+
+func (db *DB) deleteAccountsHard(ctx context.Context, ids []int64) error {
+	ids = normalizeAccountIDs(ids)
+	if len(ids) == 0 {
+		return nil
+	}
+
+	db.markHardDeletedAccountIDs(ids)
+	committed := false
+	defer func() {
+		if !committed {
+			db.unmarkHardDeletedAccountIDs(ids)
+		}
+	}()
+
+	// 先标记 tombstone 再落盘缓冲日志，避免并发请求在删除期间再次写回 usage_logs。
+	db.flushLogs()
+
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := db.deleteAccountsHardTx(ctx, tx, ids); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func normalizeAccountIDs(ids []int64) []int64 {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[int64]struct{}, len(ids))
+	normalized := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		normalized = append(normalized, id)
+	}
+	return normalized
+}
+
+func (db *DB) markHardDeletedAccountIDs(ids []int64) {
+	db.deletedAccountsMu.Lock()
+	defer db.deletedAccountsMu.Unlock()
+	if db.deletedAccountIDs == nil {
+		db.deletedAccountIDs = make(map[int64]struct{}, len(ids))
+	}
+	for _, id := range ids {
+		db.deletedAccountIDs[id] = struct{}{}
+	}
+}
+
+func (db *DB) unmarkHardDeletedAccountIDs(ids []int64) {
+	db.deletedAccountsMu.Lock()
+	defer db.deletedAccountsMu.Unlock()
+	for _, id := range ids {
+		delete(db.deletedAccountIDs, id)
+	}
+}
+
+func (db *DB) isHardDeletedAccountID(id int64) bool {
+	if id <= 0 {
+		return false
+	}
+	db.deletedAccountsMu.RLock()
+	defer db.deletedAccountsMu.RUnlock()
+	_, ok := db.deletedAccountIDs[id]
+	return ok
+}
+
+func (db *DB) filterHardDeletedUsageLogBatch(batch []usageLogEntry) []usageLogEntry {
+	if len(batch) == 0 {
+		return batch
+	}
+	filtered := batch[:0]
+	for _, entry := range batch {
+		if db.isHardDeletedAccountID(entry.AccountID) {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
+func (db *DB) deleteAccountsHardTx(ctx context.Context, tx *sql.Tx, ids []int64) error {
+	deleteSettlements, err := db.tableExistsTx(ctx, tx, "public_account_settlements")
+	if err != nil {
+		return err
+	}
+
 	const batchSize = 500
 	for i := 0; i < len(ids); i += batchSize {
 		end := i + batchSize
@@ -1918,29 +2043,63 @@ func (db *DB) BatchSoftDeleteAccounts(ctx context.Context, ids []int64) error {
 		}
 		batch := ids[i:end]
 
-		placeholders := make([]string, len(batch))
-		args := make([]interface{}, 0, len(batch))
-		for j, id := range batch {
-			placeholders[j] = fmt.Sprintf("$%d", j+1)
-			args = append(args, id)
+		if err := deleteRowsByAccountIDs(ctx, tx, "usage_logs", batch); err != nil {
+			return fmt.Errorf("delete usage_logs batch %d-%d failed: %w", i, end, err)
 		}
-
-		query := fmt.Sprintf(
-			`UPDATE accounts
-			SET status = 'deleted',
-				error_message = '',
-				cooldown_reason = '',
-				cooldown_until = NULL,
-				deleted_at = CURRENT_TIMESTAMP,
-				updated_at = CURRENT_TIMESTAMP
-			WHERE status <> 'deleted' AND id IN (%s)`,
-			strings.Join(placeholders, ","),
-		)
-		if _, err := db.conn.ExecContext(ctx, query, args...); err != nil {
-			return fmt.Errorf("batch %d-%d failed: %w", i, end, err)
+		if deleteSettlements {
+			if err := deleteRowsByAccountIDs(ctx, tx, "public_account_settlements", batch); err != nil {
+				return fmt.Errorf("delete public_account_settlements batch %d-%d failed: %w", i, end, err)
+			}
+		}
+		if err := deleteRowsByIDs(ctx, tx, "accounts", batch); err != nil {
+			return fmt.Errorf("delete accounts batch %d-%d failed: %w", i, end, err)
 		}
 	}
 	return nil
+}
+
+func (db *DB) tableExistsTx(ctx context.Context, tx *sql.Tx, table string) (bool, error) {
+	var exists bool
+	query := `
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.tables
+			WHERE table_schema = ANY (current_schemas(false))
+			  AND table_name = $1
+		)
+	`
+	if db.isSQLite() {
+		query = `SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = $1)`
+	}
+	if err := tx.QueryRowContext(ctx, query, table).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check table %s exists: %w", table, err)
+	}
+	return exists, nil
+}
+
+func deleteRowsByAccountIDs(ctx context.Context, tx *sql.Tx, table string, ids []int64) error {
+	return deleteRowsByColumn(ctx, tx, table, "account_id", ids)
+}
+
+func deleteRowsByIDs(ctx context.Context, tx *sql.Tx, table string, ids []int64) error {
+	return deleteRowsByColumn(ctx, tx, table, "id", ids)
+}
+
+func deleteRowsByColumn(ctx context.Context, tx *sql.Tx, table string, column string, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	placeholders := make([]string, len(ids))
+	args := make([]interface{}, 0, len(ids))
+	for i, id := range ids {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args = append(args, id)
+	}
+
+	query := fmt.Sprintf(`DELETE FROM %s WHERE %s IN (%s)`, table, column, strings.Join(placeholders, ","))
+	_, err := tx.ExecContext(ctx, query, args...)
+	return err
 }
 
 // BatchInsertAccountEventsAsync 批量异步插入账号事件

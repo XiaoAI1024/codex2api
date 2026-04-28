@@ -294,40 +294,9 @@ func hasResponsesImageGenerationTool(body map[string]any) bool {
 }
 
 func ensureResponsesImageGenerationTool(body map[string]any) bool {
-	if len(body) == 0 {
-		return false
-	}
-	defaultTool := map[string]any{
-		"type":  "image_generation",
-		"model": defaultImagesToolModel,
-	}
-	rawTools, ok := body["tools"]
-	if !ok || rawTools == nil {
-		body["tools"] = []any{defaultTool}
-		return true
-	}
-	tools, ok := rawTools.([]any)
-	if !ok {
-		body["tools"] = []any{defaultTool}
-		return true
-	}
-	for _, rawTool := range tools {
-		toolMap, ok := rawTool.(map[string]any)
-		if !ok {
-			continue
-		}
-		if strings.TrimSpace(firstNonEmptyAnyString(toolMap["type"])) == "image_generation" {
-			return false
-		}
-	}
-	if len(tools) >= maxTools {
-		truncated := append([]any(nil), tools[:maxTools]...)
-		truncated[maxTools-1] = defaultTool
-		body["tools"] = truncated
-		return true
-	}
-	body["tools"] = append(tools, defaultTool)
-	return true
+	// Image generation is explicit-only for ordinary Responses requests.
+	// normalizeResponsesImageOnlyModel handles model=gpt-image-2 separately.
+	return false
 }
 
 func firstResponsesImageGenerationTool(body map[string]any) map[string]any {
@@ -802,7 +771,6 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 			}
 		}
 	}
-	ensureResponsesImageGenerationTool(body)
 	moveTopLevelResponsesImageOptions(body)
 	normalizeResponsesImageGenerationTools(body, promptText)
 	applyResponsesImageGenerationBridgeInstructions(body)
@@ -859,6 +827,7 @@ func PrepareCompactResponsesBody(rawBody []byte) ([]byte, string) {
 	body, _ = sjson.DeleteBytes(body, "include")
 	body, _ = sjson.DeleteBytes(body, "store")
 	body, _ = sjson.DeleteBytes(body, "stream")
+	body, _ = sjson.DeleteBytes(body, "parallel_tool_calls")
 	return body, expandedInputRaw
 }
 
